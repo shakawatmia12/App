@@ -173,7 +173,20 @@ def detect_imports(script_path):
 # from a list, argparse declarations, ...) is gone: none of that
 # complexity exists on this side at all anymore.
 
-_LIVE_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_LIVE_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[a-zA-Z]"       # CSI sequences: colours, cursor moves, clear-line, etc.
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC sequences (e.g. terminal title changes)
+    r"|\x1b[()][A-Za-z0-9]"          # charset-select sequences
+    r"|\x1b[=>78]"                   # keypad/cursor save-restore, no-argument ESC codes
+)
+# Plain control bytes a real terminal would interpret specially rather than
+# print literally -- \r (carriage return, used by progress bars/spinners to
+# redraw the same line) and \x08 (backspace). A TextInput widget has no
+# concept of "move cursor back to column 0 and overwrite" the way a real
+# terminal does, so left in place these show up as visible junk smashed
+# into the output box, and can also corrupt menu-line detection below by
+# concatenating what a script intended as separate redraws of one line.
+_CONTROL_CHAR_RE = re.compile(r"[\r\x08]")
 _LIVE_MENU_LINE_RE = re.compile(r'^\s*[\[\(]?\s*(\d{1,2})\s*[\]\)]?\s*[.\-:]?\s*(.+?)\s*$')
 
 _NUMBER_PROMPT_HINT_RE = re.compile(
@@ -184,7 +197,10 @@ _PROXY_PROMPT_HINT_RE = re.compile(r"proxy", re.IGNORECASE)
 
 
 def strip_ansi(text):
-    return _LIVE_ANSI_RE.sub("", text) if text else text
+    if not text:
+        return text
+    text = _LIVE_ANSI_RE.sub("", text)
+    return _CONTROL_CHAR_RE.sub("", text)
 
 
 def parse_menu_options(text):

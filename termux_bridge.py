@@ -160,19 +160,51 @@ FALLBACK_FIFO = __FALLBACK_FIFO_REPR__
 
 sys.argv = [SCRIPT_PATH] + list(ARGS)
 
+# PYTHONUNBUFFERED=1 and `python -u` are already set at the shell level
+# (see build_interactive_run_command's run_inner) -- that's what actually
+# unbuffers this whole process's stdio from the moment it starts, which a
+# reconfigure() call after the fact cannot retroactively fix if it didn't
+# take. This is just defense-in-depth for the narrow case where something
+# (a library the target script imports, a broken environment) resets
+# stdout's buffering mode after startup -- cheap, and never harmful.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except (AttributeError, ValueError, OSError):
+    pass
+
 _channel = ("none", None)
+
+# main.py's socket server starts in a background thread during its own
+# __init__ -- there is a real window, right after this wrapper process
+# spawns, where that thread hasn't reached accept() yet (app just cold
+# started, or was busy on the main thread at that exact moment). A single
+# connect() attempt racing that window would spuriously fall back to the
+# FIFO channel every time on a slow-starting device, even though the
+# socket path would have worked fine a fraction of a second later. Retry
+# a handful of times with a short delay before giving up on the socket.
+_CONNECT_RETRIES = 10
+_CONNECT_RETRY_DELAY = 0.3
 
 
 def _connect():
     global _channel
+    for attempt in range(_CONNECT_RETRIES):
+        try:
+            sock = socket.create_connection((HOST, PORT), timeout=5)
+            _channel = ("socket", sock.makefile(
+                "rw", encoding="utf-8", newline="\n", errors="replace"
+            ))
+            return
+        except OSError:
+            if attempt < _CONNECT_RETRIES - 1:
+                time.sleep(_CONNECT_RETRY_DELAY)
     try:
-        sock = socket.create_connection((HOST, PORT), timeout=5)
-        _channel = ("socket", sock.makefile("rw", encoding="utf-8", newline="\n"))
-        return
-    except OSError:
-        pass
-    try:
-        _channel = ("fifo", open(FALLBACK_FIFO, "r", encoding="utf-8"))
+        # errors="replace": a stray non-UTF-8 byte from the target script
+        # (a mis-encoded print(), binary-ish output) must never raise and
+        # kill this whole relay -- better to show a replacement character
+        # than crash the bridge and lose the rest of the run's output.
+        _channel = ("fifo", open(FALLBACK_FIFO, "r", encoding="utf-8", errors="replace"))
     except OSError:
         _channel = ("none", None)
 
@@ -409,12 +441,22 @@ def send_answer(filename, value):
 
 
 def build_stop_command(filename):
+    """Kill whatever Run Script last started, escalating to SIGKILL if it's
+    still alive half a second after the initial (default SIGTERM) kill --
+    a script blocked deep in a call that ignores or defers SIGTERM (some
+    C extensions, or a script that traps it) would otherwise linger
+    running in the background indefinitely after the user has already
+    been told it stopped."""
     paths = _run_paths(filename)
+    pid_file = shlex.quote(RUN_PID_FILE)
     return (
-        f"if [ -f {shlex.quote(RUN_PID_FILE)} ]; then "
-        f"kill $(cat {shlex.quote(RUN_PID_FILE)}) 2>/dev/null "
-        f"&& echo 'Stop signal sent to the running script.' "
-        f"|| echo 'The script had already finished.'; "
+        f"if [ -f {pid_file} ]; then "
+        f"PID=$(cat {pid_file}); "
+        f"if kill -0 $PID 2>/dev/null; then "
+        f"kill $PID 2>/dev/null; sleep 0.5; "
+        f"kill -0 $PID 2>/dev/null && kill -9 $PID 2>/dev/null; "
+        f"echo 'Stop signal sent to the running script.'; "
+        f"else echo 'The script had already finished.'; fi; "
         f"else echo 'No running script is being tracked.'; fi; "
         f"kill $(cat {shlex.quote(paths['feed_pid'])}) 2>/dev/null; "
         f"rm -f {shlex.quote(paths['fifo'])}"

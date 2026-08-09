@@ -2,6 +2,7 @@
 import os
 import socket
 import threading
+import time
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -300,15 +301,35 @@ class RootWidget(BoxLayout):
         without instant prompt notifications (falls back to the
         polling/quiet-detection heuristic instead).
         """
-        try:
-            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind((termux_bridge.SOCKET_HOST, termux_bridge.SOCKET_PORT))
-            server.listen(1)
-        except OSError as exc:
+        BIND_RETRIES = 3
+        BIND_RETRY_DELAY = 0.5
+        server = None
+        last_exc = None
+        for attempt in range(BIND_RETRIES):
+            try:
+                server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                # SO_REUSEADDR: lets a fast app restart re-bind port 9988
+                # immediately instead of failing with "Address already in
+                # use" while the previous socket lingers in the OS's
+                # TIME_WAIT/CLOSE_WAIT state.
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server.bind((termux_bridge.SOCKET_HOST, termux_bridge.SOCKET_PORT))
+                server.listen(1)
+                last_exc = None
+                break
+            except OSError as exc:
+                last_exc = exc
+                try:
+                    server.close()
+                except (OSError, AttributeError):
+                    pass
+                server = None
+                if attempt < BIND_RETRIES - 1:
+                    time.sleep(BIND_RETRY_DELAY)
+        if server is None:
             self._socket_server = None
             Clock.schedule_once(lambda dt: self._append_output(
-                f"[Debug] Local socket server unavailable ({exc}) -- "
+                f"[Debug] Local socket server unavailable ({last_exc}) -- "
                 "interactive runs will use the FIFO fallback only.\n"
             ))
             return
@@ -321,8 +342,13 @@ class RootWidget(BoxLayout):
                 conn, _addr = self._socket_server.accept()
             except OSError:
                 return
-            rfile = conn.makefile("r", encoding="utf-8", newline="\n")
-            wfile = conn.makefile("w", encoding="utf-8", newline="\n")
+            # errors="replace": a stray non-UTF-8 byte on either side must
+            # never blow up this accept/read loop with a UnicodeDecodeError
+            # -- that would silently kill live updates for the rest of the
+            # run (falling back to slow log-polling) over a single bad
+            # byte in one line of a script's output.
+            rfile = conn.makefile("r", encoding="utf-8", newline="\n", errors="replace")
+            wfile = conn.makefile("w", encoding="utf-8", newline="\n", errors="replace")
             with self._socket_lock:
                 self._socket_conn = wfile
             self._socket_read_loop(rfile)
@@ -383,6 +409,23 @@ class RootWidget(BoxLayout):
 
     def _on_socket_done(self):
         self._finish_run()
+
+    def _close_socket_conn(self):
+        """Proactively drop the current connection instead of waiting for
+        the OS to notice the Termux-side wrapper process died (Stop kills
+        it, or it exits normally) -- otherwise a stale write-file object
+        could briefly look connected (_socket_conn is not None) right as
+        a NEW run starts, before the accept loop has had a chance to
+        notice the old peer is gone and clear it itself."""
+        with self._socket_lock:
+            wfile = self._socket_conn
+            self._socket_conn = None
+        if wfile is not None:
+            try:
+                wfile.close()
+            except OSError:
+                pass
+        self._socket_active = False
 
     def _send_via_socket(self, value):
         with self._socket_lock:
@@ -700,6 +743,7 @@ class RootWidget(BoxLayout):
         self._script_running = False
         self.run_button_text = "Run Script"
         self._awaiting_input = False
+        self._close_socket_conn()
         self._show_finished_notice("Script Stopped")
         if self._poll_event:
             self._poll_event.cancel()
@@ -738,7 +782,13 @@ class RootWidget(BoxLayout):
         self._shown_chunk_len = 0
         self._quiet_ticks = 0
         self._awaiting_input = False
-        self._socket_active = False
+        # Drop any leftover connection from a PREVIOUS run before this one
+        # starts -- without this, a stale wfile object from a script that
+        # exited abnormally (killed, crashed) and hadn't been noticed as
+        # gone yet could let an early write briefly appear "sent" over a
+        # dead socket before failing, instead of cleanly falling back to
+        # the FIFO path for a fresh connection's first prompt.
+        self._close_socket_conn()
         # Consumed by _on_socket_prompt as each PROMPT: notification
         # arrives over the socket -- the FIFO-fallback path instead gets
         # the same values pre-seeded into the answers file up front (see
@@ -1098,6 +1148,7 @@ class RootWidget(BoxLayout):
         self._script_running = False
         self.run_button_text = "Run Script"
         self._awaiting_input = False
+        self._close_socket_conn()
         self._show_finished_notice("Script Finished")
         if self._poll_event:
             self._poll_event.cancel()
@@ -1150,7 +1201,22 @@ class ScriptWrapperApp(App):
                 Permission.WRITE_EXTERNAL_STORAGE,
             ])
         Builder.load_string(KV)
-        return RootWidget()
+        self.root_widget = RootWidget()
+        return self.root_widget
+
+    def on_stop(self):
+        """Close the listening socket cleanly when the app itself is
+        killed/backgrounded-and-reclaimed -- without this, the OS could
+        take longer to release port 9988 on the next launch, and
+        SO_REUSEADDR is a mitigation for that race, not a substitute for
+        actually closing the socket when we're done with it."""
+        widget = getattr(self, "root_widget", None)
+        server = getattr(widget, "_socket_server", None) if widget is not None else None
+        if server is not None:
+            try:
+                server.close()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
