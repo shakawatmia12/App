@@ -10,15 +10,18 @@ source.include_exts = py,png,jpg,kv,atlas,json
 version = 1.0.0
 
 # main.py imports these; pyjnius drives the Termux RUN_COMMAND intent and
-# the storage-settings intent. plyer drives the file picker via Android's
-# Storage Access Framework (SAF) -- SAF is exempt from the scoped-storage
-# directory-listing restriction that broke Kivy's own raw FileChooser.
+# the storage-settings intent. androidstorage4kivy is the primary file
+# picker/reader: it hands back the SAF content reference (not a resolved
+# path) and reads it via ContentResolver, which is the only thing that
+# reliably bypasses Android 10+ scoped storage for our own process. plyer
+# is kept as a secondary picker for platforms/older Android where that
+# isn't needed.
 # NOTE: do not pin kivy's version here. python-for-android's bundled
 # python3 recipe tracks a recent CPython (currently 3.14), and older Kivy
 # releases (e.g. 2.3.0) ship pre-generated Cython C code that fails to
 # compile against newer CPython C-API internals. Leaving kivy unpinned
 # lets pip resolve the latest release, which carries the compatibility fix.
-requirements = python3,kivy,pyjnius,plyer,android
+requirements = python3,kivy,pyjnius,plyer,androidstorage4kivy,android
 
 orientation = portrait
 fullscreen = 0
@@ -38,15 +41,14 @@ fullscreen = 0
 # depending on version; requesting it here is required either way).
 android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,MANAGE_EXTERNAL_STORAGE,com.termux.permission.RUN_COMMAND
 
-# android.api is targetSdkVersion. We deliberately keep it at 28 (below
-# Android 10's scoped-storage threshold of 29): a confirmed test showed
-# that even *reading* a plain path like /storage/emulated/0/Download/x.py
-# raises PermissionError on Android 10 once targetSdkVersion >= 29, no
-# matter that the legacy Storage permission is granted. Apps targeting
-# API < 29 are exempt from scoped storage entirely, on every Android
-# version released so far. This does NOT affect compileSdkVersion, which
-# p4a's Gradle template pins independently for toolchain compatibility.
-android.api = 28
+# Reverted: lowering android.api to 28 to dodge scoped storage also drags
+# compileSdkVersion down with it in this p4a version (they're the same
+# value here, not independent) -- Kivy's bundled SDL2 Java glue
+# (HIDDeviceManager.java) references Manifest.permission.BLUETOOTH_CONNECT
+# (API 31+), which then fails to compile. Storage access is instead
+# handled in Python via Android's Storage Access Framework / MediaStore
+# (see androidstorage4kivy usage in main.py) rather than a raw path read.
+android.api = 33
 android.minapi = 24
 android.ndk = 25b
 # Single arch keeps the first CI build faster/less failure-prone.

@@ -22,16 +22,33 @@ try:
 except ImportError:
     ON_ANDROID = False
 
-# NOTE on the back-and-forth in this file's history: we tried browsing
-# /sdcard directly with Kivy's own FileChooserListView (os.listdir), but
-# on Android 10+ that returns an EMPTY listing for any app whose
-# targetSdkVersion is 29+ -- scoped storage blocks raw directory
-# enumeration outright, permission grant or not. Android's own Storage
-# Access Framework (SAF) picker is exempt from that restriction because
-# the *system*, not our app, does the browsing. plyer's Android
-# filechooser drives SAF and resolves the result back to a real
-# filesystem path (via the externalstorage/media documents providers),
-# which is what both our own file reads and Termux need.
+# NOTE on the back-and-forth in this file's history:
+# 1) Browsing /sdcard directly with Kivy's own FileChooserListView
+#    (os.listdir) returns a completely EMPTY listing on Android 10+ for
+#    any app targeting API 29+ -- scoped storage blocks raw directory
+#    enumeration outright, storage permission granted or not.
+# 2) plyer's SAF-backed picker (ACTION_GET_CONTENT) avoids that and can
+#    resolve a real filesystem path -- but *reading* that resolved path
+#    with plain open() still raises PermissionError on Android 10+,
+#    confirmed on a real device, because our own process is still
+#    scoped-storage-restricted regardless of which path string it holds.
+# 3) androidstorage4kivy's Chooser hands back the original SAF content
+#    reference (not a resolved path), and copy_from_shared() reads it via
+#    ContentResolver under the picker's own permission grant, bypassing
+#    scoped storage entirely for OUR read. copy_to_shared() then publishes
+#    the file into a public MediaStore collection, which lands as a real
+#    file on disk that Termux (full, unrestricted storage access) can run
+#    directly -- Termux was never the problem, our own process reading
+#    arbitrary paths was.
+try:
+    from androidstorage4kivy import Chooser, SharedStorage
+except ImportError:
+    Chooser = None
+    SharedStorage = None
+
+# Kept as a secondary picker for platforms/devices where the above isn't
+# available (e.g. pre-scoped-storage Android): plyer resolves SAF picks to
+# a real path directly, which works fine when nothing blocks reading it.
 try:
     from plyer import filechooser
 except ImportError:
@@ -171,6 +188,13 @@ class RootWidget(BoxLayout):
         self.field_widgets = {}
         self._poll_event = None
 
+        if ON_ANDROID and SharedStorage is not None and Chooser is not None:
+            self.shared_storage = SharedStorage()
+            self.chooser = Chooser(self._on_chooser_selection)
+        else:
+            self.shared_storage = None
+            self.chooser = None
+
     # ---- One-time Termux setup -------------------------------------------
     def setup_termux(self):
         """Copy the setup command and bring Termux to the front.
@@ -252,55 +276,102 @@ class RootWidget(BoxLayout):
 
     # ---- Script selection -------------------------------------------------
     def pick_script(self):
-        # Deliberately no `filters=` here: Android's SAF filters by MIME
-        # type and ".py" has no reliable MIME mapping on most devices --
-        # passing a filter made every .py file disappear from the picker.
-        # Show all files and validate the extension/content afterward.
-        if filechooser is None:
-            self._show_message("File chooser is unavailable on this platform.")
+        if self.chooser is not None:
+            self.chooser.choose_content("*/*")
             return
-        try:
-            filechooser.open_file(on_selection=self._on_file_selected, path="/sdcard")
-        except Exception as exc:
-            self._append_output(f"[error] Could not open file picker: {exc}\n")
+        if filechooser is not None:
+            try:
+                filechooser.open_file(on_selection=self._on_file_selected, path="/sdcard")
+            except Exception as exc:
+                self._append_output(f"[error] Could not open file picker: {exc}\n")
+            return
+        self._show_message("No file picker available -- use 'Load Path' below instead.")
 
-    def _on_file_selected(self, selection):
-        # Log whatever plyer hands back, even empty/odd values -- some
-        # picker sources (Recent files, cloud providers) return a
-        # content:// URI plyer can't resolve to a real path, and this is
-        # the only way to see that without device logcat access.
-        self._append_output(f"[picker] Selection returned: {selection!r}\n")
-        if not selection:
-            self._append_output(
-                "[picker] Empty selection -- either you cancelled, or this "
-                "picker source doesn't hand back a usable path. Try 'My "
-                "Files' > Internal storage directly, or use 'Load Path' "
-                "below with the file's full path typed in.\n"
-            )
+    def _on_chooser_selection(self, shared_file_list):
+        if not shared_file_list:
             return
-        # plyer's callback can fire off the main thread; hop back onto it.
-        Clock.schedule_once(lambda dt: self._load_script(selection[0]))
+        Clock.schedule_once(lambda dt: self._handle_picked_file(shared_file_list[0]))
+
+    def _handle_picked_file(self, shared_file):
+        """Read a SAF-picked file via androidstorage4kivy, then publish it
+        to public shared storage so Termux can run it by real path.
+
+        See the module-level NOTE above pick_script's imports for why this
+        two-step copy is necessary instead of just using a resolved path.
+        """
+        try:
+            private_path = self.shared_storage.copy_from_shared(shared_file)
+        except Exception as exc:
+            self._append_output(f"[error] Could not read picked file: {exc}\n")
+            return
+        if not private_path:
+            self._append_output("[error] Could not read the picked file (no data returned).\n")
+            return
+
+        filename = os.path.basename(private_path)
+        if not filename.lower().endswith(".py"):
+            self._show_message(f"'{filename}' is not a .py file. Pick a Python script.")
+            return
+
+        try:
+            schema = schema_engine.load_schema_from_file(private_path)
+        except schema_engine.SchemaError as exc:
+            self._show_message(str(exc))
+            return
+
+        try:
+            from jnius import autoclass
+
+            Environment = autoclass("android.os.Environment")
+            shared_ref = self.shared_storage.copy_to_shared(
+                private_path, collection=Environment.DIRECTORY_DOCUMENTS
+            )
+        except Exception as exc:
+            self._append_output(f"[error] Could not publish script for Termux: {exc}\n")
+            return
+        if not shared_ref:
+            self._append_output("[error] Could not publish script for Termux (no reference returned).\n")
+            return
+
+        run_path = f"/storage/emulated/0/{shared_ref}"
+        self._apply_loaded_script(schema, run_path, filename)
+        self._append_output(f"[schema] Termux will run: {run_path}\n")
 
     def load_manual_path(self, path):
         path = path.strip()
         if not path:
             self._show_message("Type a full file path first.")
             return
-        self._load_script(path)
+        self._load_script_from_plain_path(path)
 
-    def _load_script(self, path):
+    def _on_file_selected(self, selection):
+        if not selection:
+            return
+        # plyer's callback can fire off the main thread; hop back onto it.
+        Clock.schedule_once(lambda dt: self._load_script_from_plain_path(selection[0]))
+
+    def _load_script_from_plain_path(self, path):
+        """Used by the manual path box and the plyer fallback picker: reads
+        and runs the same plain path directly, no shared-storage copy.
+        Works when the device doesn't enforce scoped storage, or when
+        'Grant Storage Access' (MANAGE_EXTERNAL_STORAGE) has been granted.
+        """
         if not path.lower().endswith(".py"):
             self._show_message(f"'{os.path.basename(path)}' is not a .py file. Pick a Python script.")
             return
 
         try:
-            self.schema = schema_engine.load_schema_from_file(path)
+            schema = schema_engine.load_schema_from_file(path)
         except schema_engine.SchemaError as exc:
             self._show_message(str(exc))
             return
 
-        self.script_path = path
-        self.script_name = os.path.basename(path)
+        self._apply_loaded_script(schema, path, os.path.basename(path))
+
+    def _apply_loaded_script(self, schema, run_path, display_name):
+        self.schema = schema
+        self.script_path = run_path
+        self.script_name = display_name
         self._build_form()
         self._append_output(f"[schema] Loaded '{self.schema.get('name')}' "
                              f"({len(schema_engine.get_fields(self.schema))} fields, "
@@ -308,11 +379,17 @@ class RootWidget(BoxLayout):
 
     # ---- Dynamic form -------------------------------------------------
     def _build_form(self):
+        # NOTE: fields always start from the schema's declared defaults,
+        # not a previously-saved config -- Termux owns the per-script
+        # config file now (see save_config()/termux_bridge.save_config),
+        # and our own scoped-storage-restricted process can't reliably
+        # read it back to pre-fill the form. Save Config still writes the
+        # values Termux actually runs with; only this pre-fill convenience
+        # is what's traded away.
         grid = self.ids.form_grid
         grid.clear_widgets()
         self.field_widgets = {}
 
-        saved_values = schema_engine.load_config_for_script(self.script_path)
         fields = schema_engine.get_fields(self.schema)
 
         if not fields:
@@ -322,8 +399,7 @@ class RootWidget(BoxLayout):
 
         for field in fields:
             grid.add_widget(Label(text=field["label"], size_hint_y=None, height=44))
-            value = saved_values.get(field["key"], field["default"])
-            widget = self._make_field_widget(field, value)
+            widget = self._make_field_widget(field, field["default"])
             self.field_widgets[field["key"]] = (field, widget)
             grid.add_widget(widget)
 
@@ -366,8 +442,9 @@ class RootWidget(BoxLayout):
             self._show_message("Select a script first.")
             return
         values = self._collect_form_values()
-        path = schema_engine.save_config_for_script(self.script_path, values)
-        self._append_output(f"[config] Saved settings to {path}\n")
+        config_path = termux_bridge.config_path_for(self.script_path)
+        self._append_output(f"[config] Saving settings to {config_path} via Termux...\n")
+        self._run_bridge_action(lambda: termux_bridge.save_config(self.script_path, values))
 
     def install_packages(self):
         packages = schema_engine.get_packages(self.schema)

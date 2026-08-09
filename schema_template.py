@@ -49,26 +49,31 @@ SCHEMA = {
 
 
 def load_saved_config():
-    """Read this script's own saved settings back from /sdcard/config.json.
+    """Read this script's own saved settings back from Termux's shared dir.
 
-    The wrapper app writes {"<absolute_script_path>": {...values...}} into
-    that file before launching the script, so a wrapped script can call
-    this at startup to pick up whatever the user configured in the UI.
+    The wrapper app's "Save Config" delegates the actual write to Termux
+    (its own process is scoped-storage-restricted on Android 10+ and can't
+    reliably write shared paths itself), landing at
+    /sdcard/termux_wrapper/config_<12-char md5 of the script's own run
+    path>.json -- one small file per script rather than one shared file,
+    so Termux can just overwrite it with `base64 -d > file`, no JSON
+    read-modify-write required on that side. Must match
+    termux_bridge.config_path_for() exactly.
     """
+    import hashlib
     import json
     import os
     import sys
 
-    config_path = "/sdcard/config.json"
     script_path = os.path.abspath(sys.argv[0])
+    digest = hashlib.md5(script_path.encode("utf-8")).hexdigest()[:12]
+    config_path = f"/sdcard/termux_wrapper/config_{digest}.json"
 
     if not os.path.isfile(config_path):
         return {}
 
     with open(config_path, "r", encoding="utf-8") as f:
-        all_config = json.load(f)
-
-    return all_config.get(script_path, {})
+        return json.load(f)
 
 
 if __name__ == "__main__":
