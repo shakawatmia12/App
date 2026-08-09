@@ -232,10 +232,13 @@ def _collect_menu_options(source_lines, input_lineno, max_lookback=25):
     full parsing. Blank lines and comments between the menu and the
     input() (very common for readability) are skipped rather than
     treated as "no menu here"; a single print() with embedded "\\n"
-    joining several options is also split apart. Anything that isn't a
-    blank/comment/matching print line stops the scan -- so a for-loop
+    joining several options is also split apart. A non-numbered print()
+    line mixed into the block (a header like print("Choose a domain:")
+    right before the numbered options) is treated as a label and
+    ignored rather than aborting the whole match -- only a line that
+    isn't a print()/blank/comment at all stops the scan, so a for-loop
     building the menu dynamically, or unrelated code above the prompt,
-    safely yields no menu instead of a guess.
+    still safely yields no menu instead of a guess.
     """
     menu_texts = []
     idx = input_lineno - 2  # 0-indexed line immediately above the input() line
@@ -256,10 +259,10 @@ def _collect_menu_options(source_lines, input_lineno, max_lookback=25):
     options, raw_values = [], []
     for text in menu_texts:
         m = _MENU_LINE_RE.match(text.strip())
-        if not m:
-            return None, None
-        raw_values.append(m.group(1))
-        options.append(f"{m.group(1)}) {m.group(2)}")
+        if m:
+            raw_values.append(m.group(1))
+            options.append(f"{m.group(1)}) {m.group(2)}")
+        # else: a non-numbered line (header/label) -- ignore, don't abort
 
     if len(options) >= 2:
         return options, raw_values
