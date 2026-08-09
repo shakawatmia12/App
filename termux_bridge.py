@@ -52,6 +52,23 @@ INSTALL_LOG = f"{LOG_DIR}/install_output.log"
 RUN_LOG = f"{LOG_DIR}/run_output.log"
 RUN_PID_FILE = f"{SCRIPTS_DIR}/_last_run.pid"
 
+# The FIFO/answers-queue/feeder-pid trio for an interactive run MUST live
+# under Termux's own internal storage, never under /sdcard: /sdcard is a
+# FUSE-backed virtual filesystem (for Android's scoped-storage
+# enforcement), and FUSE generally doesn't support real named pipes --
+# `mkfifo` there can silently behave like a plain file instead of
+# erroring. A plain file has no "block until a writer shows up" blocking
+# read behaviour a FIFO has: reading it past its (empty) end just returns
+# EOF immediately, which is exactly what made a script's very first
+# input() see an instant empty read before the user had answered
+# anything. Termux's own home directory is on the app's private internal
+# storage (a real filesystem, full POSIX support) -- confirmed as the
+# fix. Nothing here is ever read by OUR OWN process directly (unlike
+# RUN_LOG/INSTALL_LOG, which our app polls straight off /sdcard), so
+# there's no accessibility downside to keeping it entirely on Termux's
+# side.
+RUNTIME_DIR = f"{TERMUX_HOME}/.script_wrapper_run"
+
 # Printed once a script's process has actually exited, so polling the log
 # can tell "finished" apart from "just quiet for a moment" -- see
 # build_interactive_run_command.
@@ -92,9 +109,9 @@ def _run_paths(filename):
 
     stem = schema_engine.sanitize_name(filename)
     return {
-        "fifo": f"{SCRIPTS_DIR}/_run_{stem}.fifo",
-        "answers": f"{SCRIPTS_DIR}/_run_{stem}_answers.txt",
-        "feed_pid": f"{SCRIPTS_DIR}/_run_{stem}_feed.pid",
+        "fifo": f"{RUNTIME_DIR}/_run_{stem}.fifo",
+        "answers": f"{RUNTIME_DIR}/_run_{stem}_answers.txt",
+        "feed_pid": f"{RUNTIME_DIR}/_run_{stem}_feed.pid",
     }
 
 
@@ -132,7 +149,7 @@ def build_interactive_run_command(content, filename, extra_args=None, preset_ans
     paths = _run_paths(filename)
     fifo, answers, feed_pid = paths["fifo"], paths["answers"], paths["feed_pid"]
 
-    mkdir_dirs = {SCRIPTS_DIR, os.path.dirname(target)}
+    mkdir_dirs = {SCRIPTS_DIR, os.path.dirname(target), RUNTIME_DIR}
     write_parts = [f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(script_path)}"]
 
     if attachments:
