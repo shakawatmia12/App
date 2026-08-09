@@ -156,10 +156,19 @@ def send_termux_command(shell_command, session_action="0", background=False):
     intent.putExtra("com.termux.RUN_COMMAND_WORKDIR", JString(TERMUX_HOME))
     intent.putExtra("com.termux.RUN_COMMAND_BACKGROUND", bool(background))
     intent.putExtra("com.termux.RUN_COMMAND_SESSION_ACTION", JString(str(session_action)))
-    intent.putExtra(
-        "com.termux.RUN_COMMAND_ARGUMENTS",
-        _to_java_string_array(["-c", shell_command]),
-    )
+    # Confirmed on device: passing a plain Python list here actually
+    # works fine (pyjnius auto-converts it to the String[] this putExtra
+    # overload expects) -- every earlier failure got past this line just
+    # fine. _to_java_string_array() as the unconditional path instead
+    # broke with "Cannot convert list to jnius.JavaClass", so it's kept
+    # only as a fallback, not used first.
+    try:
+        intent.putExtra("com.termux.RUN_COMMAND_ARGUMENTS", ["-c", shell_command])
+    except Exception:
+        intent.putExtra(
+            "com.termux.RUN_COMMAND_ARGUMENTS",
+            _to_java_string_array(["-c", shell_command]),
+        )
 
     # Plain framework Activity methods instead of androidx.core's
     # ContextCompat.startForegroundService(): buildozer/p4a's default
