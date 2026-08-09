@@ -112,22 +112,6 @@ KV = """
     BoxLayout:
         size_hint_y: None
         height: dp(40)
-        spacing: dp(8)
-
-        TextInput:
-            id: manual_path_input
-            hint_text: "Or type the full path, e.g. /storage/emulated/0/Download/multi3.py"
-            multiline: False
-
-        Button:
-            text: "Load Path"
-            size_hint_x: None
-            width: dp(110)
-            on_release: root.load_manual_path(manual_path_input.text)
-
-    BoxLayout:
-        size_hint_y: None
-        height: dp(40)
         canvas.before:
             Color:
                 rgba: root.status_color
@@ -169,8 +153,8 @@ KV = """
             on_release: root.install_packages()
 
         Button:
-            text: "Run Script"
-            on_release: root.run_script()
+            text: root.run_button_text
+            on_release: root.on_run_stop_pressed()
 
     BoxLayout:
         size_hint_y: None
@@ -209,6 +193,7 @@ class RootWidget(BoxLayout):
     output_text = StringProperty("Output will appear here after you run a script.\n")
     status_text = StringProperty("Ready.")
     status_color = ListProperty([0.25, 0.25, 0.25, 1])
+    run_button_text = StringProperty("Run Script")
 
     STATUS_COLORS = {
         "info": [0.16, 0.32, 0.5, 1],
@@ -224,6 +209,10 @@ class RootWidget(BoxLayout):
         self._poll_event = None
         self._readable_script_path = ""
         self._auto_input_fields = False
+        self._script_running = False
+        self._pending_attachment_key = None
+        self._attached_files = {}
+        self._attachment_labels = {}
 
         if ON_ANDROID and SharedStorage is not None and Chooser is not None:
             self.shared_storage = SharedStorage()
@@ -270,8 +259,8 @@ class RootWidget(BoxLayout):
         shared storage. That requires the MANAGE_EXTERNAL_STORAGE special
         permission, which can only be granted through a Settings screen --
         no app can flip it for itself. Most flows no longer need this
-        (they go through androidstorage4kivy/SAF instead), but the manual
-        "Load Path" fallback still benefits from it on Android 11+.
+        (they go through androidstorage4kivy/SAF instead), but the plyer
+        fallback picker still benefits from it on Android 11+.
         """
         if not ON_ANDROID:
             self._show_message("Storage access request only applies on Android.")
@@ -332,10 +321,15 @@ class RootWidget(BoxLayout):
             except Exception as exc:
                 self._append_output(f"{self._friendly_error(exc)}\n")
             return
-        self._show_message("No file picker available -- use 'Load Path' below instead.")
+        self._show_message("No file picker available on this device.")
 
     def _on_chooser_selection(self, shared_file_list):
         if not shared_file_list:
+            return
+        if self._pending_attachment_key:
+            key = self._pending_attachment_key
+            self._pending_attachment_key = None
+            Clock.schedule_once(lambda dt: self._handle_picked_attachment(key, shared_file_list[0]))
             return
         Clock.schedule_once(lambda dt: self._handle_picked_file(shared_file_list[0]))
 
@@ -369,24 +363,23 @@ class RootWidget(BoxLayout):
 
         self._apply_loaded_script(schema, private_path, filename)
 
-    def load_manual_path(self, path):
-        path = path.strip()
-        if not path:
-            self._show_message("Type a full file path first.")
-            return
-        self._load_script_from_plain_path(path)
-
     def _on_file_selected(self, selection):
         if not selection:
             return
+        path = selection[0]
+        if self._pending_attachment_key:
+            key = self._pending_attachment_key
+            self._pending_attachment_key = None
+            Clock.schedule_once(lambda dt: self._store_attachment(key, path))
+            return
         # plyer's callback can fire off the main thread; hop back onto it.
-        Clock.schedule_once(lambda dt: self._load_script_from_plain_path(selection[0]))
+        Clock.schedule_once(lambda dt: self._load_script_from_plain_path(path))
 
     def _load_script_from_plain_path(self, path):
-        """Used by the manual path box and the plyer fallback picker: reads
-        the same plain path directly, no shared-storage copy. Works when
-        the device doesn't enforce scoped storage, or when 'Grant Storage
-        Access' (MANAGE_EXTERNAL_STORAGE) has been granted.
+        """Used by the plyer fallback picker: reads the same plain path
+        directly, no shared-storage copy. Works when the device doesn't
+        enforce scoped storage, or when 'Grant Storage Access'
+        (MANAGE_EXTERNAL_STORAGE) has been granted.
         """
         if not path.lower().endswith(".py"):
             self._show_message(f"'{os.path.basename(path)}' is not a .py file. Pick a Python script.")
@@ -400,12 +393,63 @@ class RootWidget(BoxLayout):
 
         self._apply_loaded_script(schema, path, os.path.basename(path))
 
+    # ---- File attachments for auto-detected "file" input() fields --------
+    def _pick_attachment(self, field_key):
+        self._pending_attachment_key = field_key
+        if self.chooser is not None:
+            self.chooser.choose_content("*/*")
+            return
+        if filechooser is not None:
+            try:
+                filechooser.open_file(on_selection=self._on_file_selected, path="/sdcard")
+            except Exception as exc:
+                self._pending_attachment_key = None
+                self._append_output(f"{self._friendly_error(exc)}\n")
+            return
+        self._pending_attachment_key = None
+        self._show_message("No file picker available on this device.")
+
+    def _handle_picked_attachment(self, field_key, shared_file):
+        try:
+            private_path = self.shared_storage.copy_from_shared(shared_file)
+        except Exception as exc:
+            self._append_output(f"{self._friendly_error(exc)}\n")
+            return
+        if not private_path:
+            self._append_output("[File Error] Could not read the attached file (no data returned).\n")
+            return
+        self._store_attachment(field_key, private_path)
+
+    def _store_attachment(self, field_key, path):
+        filename = os.path.basename(path)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError as exc:
+            self._append_output(f"{self._friendly_error(exc)}\n")
+            return
+
+        self._attached_files[field_key] = {"filename": filename, "content": content}
+        label_widget = self._attachment_labels.get(field_key)
+        if label_widget is not None:
+            label_widget.text = filename
+        field_label = self._field_label(field_key)
+        self._append_output(f"[attach] Attached '{filename}' for '{field_label}'.\n")
+
+    def _field_label(self, field_key):
+        entry = self.field_widgets.get(field_key)
+        return entry[0]["label"] if entry else field_key
+
     def _apply_loaded_script(self, schema, readable_path, display_name):
         self.schema = schema
         self.script_path = readable_path
         self.script_name = display_name
         self._readable_script_path = readable_path
         self._auto_input_fields = False
+        self._attached_files = {}
+        self._attachment_labels = {}
+        self._script_running = False
+        self.run_button_text = "Run Script"
 
         fields = schema_engine.get_fields(self.schema)
         if not fields:
@@ -523,11 +567,31 @@ class RootWidget(BoxLayout):
 
         for field in fields:
             label_text = field["label"] + (" *" if field.get("required") else "")
-            grid.add_widget(Label(text=label_text, size_hint_y=None, height=44))
+            grid.add_widget(self._make_label(label_text))
             value = saved_values.get(field["key"], field["default"])
             widget = self._make_field_widget(field, value)
             self.field_widgets[field["key"]] = (field, widget)
             grid.add_widget(widget)
+
+    def _make_label(self, text):
+        """Field labels can be long (auto-detected input() prompts easily
+        run past half the screen width) -- a plain fixed-height Label
+        with no text_size just overflows past its cell on both sides
+        instead of wrapping, which was cutting off the start of labels
+        like "Enter Usernames File...". Bind text_size to the label's own
+        width so it wraps, and height to the wrapped texture size so
+        multi-line labels don't get clipped either.
+        """
+        label = Label(text=text, size_hint_y=None, height=dp(44), halign="left", valign="middle")
+
+        def _sync_text_size(instance, value):
+            instance.text_size = (value, None)
+
+        def _sync_height(instance, value):
+            instance.height = max(dp(44), value[1] + dp(10))
+
+        label.bind(width=_sync_text_size, texture_size=_sync_height)
+        return label
 
     def _make_field_widget(self, field, value):
         ftype = field["type"]
@@ -544,6 +608,22 @@ class RootWidget(BoxLayout):
                 height=44,
             )
 
+        if ftype == "file":
+            row = BoxLayout(size_hint_y=None, height=44, spacing=dp(4))
+            existing = self._attached_files.get(field["key"])
+            name_label = Label(
+                text=existing["filename"] if existing else "No file selected",
+                shorten=True,
+                shorten_from="left",
+            )
+            name_label.bind(size=lambda inst, val: setattr(inst, "text_size", (val[0], None)))
+            browse_btn = Button(text="Browse", size_hint_x=None, width=dp(90))
+            browse_btn.bind(on_release=lambda *_a, k=field["key"]: self._pick_attachment(k))
+            row.add_widget(name_label)
+            row.add_widget(browse_btn)
+            self._attachment_labels[field["key"]] = name_label
+            return row
+
         return TextInput(
             text=str(value),
             multiline=False,
@@ -557,6 +637,8 @@ class RootWidget(BoxLayout):
         for key, (field, widget) in self.field_widgets.items():
             if field["type"] == "boolean":
                 raw = widget.active
+            elif field["type"] == "file":
+                raw = self._attached_files.get(key, {}).get("filename", "")
             else:
                 raw = widget.text
             values[key] = schema_engine.cast_field_value(field, raw)
@@ -567,8 +649,8 @@ class RootWidget(BoxLayout):
         for _key, (field, widget) in self.field_widgets.items():
             if not field.get("required"):
                 continue
-            if field["type"] == "boolean":
-                continue  # a checkbox has no "empty" state
+            if field["type"] in ("boolean", "file"):
+                continue  # no plain "empty" state for these
             if not str(widget.text).strip():
                 missing.append(field["label"])
         return missing
@@ -622,6 +704,25 @@ class RootWidget(BoxLayout):
         self._set_status("Sent -- waiting for Termux output...", "info")
         self._start_polling(termux_bridge.read_install_log)
 
+    def on_run_stop_pressed(self):
+        if self._script_running:
+            self.stop_script()
+        else:
+            self.run_script()
+
+    def stop_script(self):
+        """Best-effort: send a kill for whatever Run Script last started.
+        Safe to press even if the script already finished on its own --
+        termux_bridge.build_stop_command() just reports that instead.
+        """
+        self._append_output("[run] Sending stop signal to Termux...\n")
+        self._run_bridge_action(termux_bridge.stop_script)
+        self._script_running = False
+        self.run_button_text = "Run Script"
+        if self._poll_event:
+            self._poll_event.cancel()
+        self._set_status("Stop signal sent.", "warn")
+
     def run_script(self):
         if not self.script_path:
             self._show_message("Select a script first.")
@@ -643,13 +744,26 @@ class RootWidget(BoxLayout):
         filename = os.path.basename(self._readable_script_path)
 
         stdin_values = None
+        attachments = None
         if self._auto_input_fields:
             # Feed the form's answers to the script's own input() calls, in
             # the same source order schema_engine.detect_inputs found them.
             values = self._collect_form_values()
             stdin_values = []
+            attachments = {}
             for f in schema_engine.get_fields(self.schema):
-                val = values.get(f["key"], "")
+                key = f["key"]
+                if f["type"] == "file":
+                    attached = self._attached_files.get(key)
+                    if attached:
+                        termux_path = f"{termux_bridge.ATTACHMENTS_DIR}/{attached['filename']}"
+                        attachments[termux_path] = attached["content"]
+                        stdin_values.append(termux_path)
+                    else:
+                        stdin_values.append("")
+                    continue
+
+                val = values.get(key, "")
                 # Auto-detected dropdowns display "N) description" but the
                 # script itself only ever typed a bare number/letter into
                 # its input() -- translate back to that raw value here.
@@ -658,6 +772,7 @@ class RootWidget(BoxLayout):
                 if option_values and options and val in options:
                     val = option_values[options.index(val)]
                 stdin_values.append(str(val))
+            attachments = attachments or None
             self._append_output(
                 f"[run] Feeding {len(stdin_values)} answer(s) to the script's input() calls...\n"
             )
@@ -665,9 +780,13 @@ class RootWidget(BoxLayout):
         self._append_output(f"[run] Launching {self.script_name} in Termux...\n")
         self._set_status("Sending Run Script command to Termux...", "info")
         if not self._run_bridge_action(
-            lambda: termux_bridge.run_script_from_content(content, filename, stdin_values=stdin_values)
+            lambda: termux_bridge.run_script_from_content(
+                content, filename, stdin_values=stdin_values, attachments=attachments
+            )
         ):
             return
+        self._script_running = True
+        self.run_button_text = "Stop Script"
         self._set_status("Sent -- waiting for Termux output...", "info")
         # A longer grace period than Install Packages: user scripts can make
         # slow network calls (translation APIs, requests, etc.) before

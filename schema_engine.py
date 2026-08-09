@@ -312,6 +312,14 @@ def detect_inputs(script_path):
             field["options"] = options
             field["default"] = options[0]
             field["_option_values"] = raw_values
+        elif re.search(r"\.txt|\bfile\b", field["label"], re.IGNORECASE):
+            # Prompt text mentions "file" or a .txt example -- the script
+            # almost certainly wants a path to read from, which the user
+            # can't usefully type by hand (they don't know Termux's
+            # filesystem). Render a Browse button instead of a text box;
+            # see main.py._pick_attachment for how the picked file's
+            # content gets transferred to a path Termux can read.
+            field["type"] = "file"
 
         fields.append(field)
     return fields

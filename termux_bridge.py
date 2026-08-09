@@ -74,9 +74,12 @@ def build_install_command(packages, log_path=None):
 
 
 STDIN_FILE = f"{SCRIPTS_DIR}/_last_run_stdin.txt"
+ATTACHMENTS_DIR = f"{SCRIPTS_DIR}/attachments"
+RUN_PID_FILE = f"{SCRIPTS_DIR}/_last_run.pid"
 
 
-def build_run_command_from_content(content, filename, extra_args=None, stdin_values=None, log_path=None):
+def build_run_command_from_content(content, filename, extra_args=None, stdin_values=None,
+                                    attachments=None, log_path=None):
     """Have Termux write the script's content to a path it owns, then run
     it -- see the module docstring for why we hand Termux content instead
     of a path we published via MediaStore.
@@ -87,19 +90,33 @@ def build_run_command_from_content(content, filename, extra_args=None, stdin_val
     written to a plain file and redirected in as stdin, so the script's
     own input() calls read them exactly as if someone had typed them --
     without stdin_values, we redirect from /dev/null instead (see below).
+
+    attachments: dict of {termux_plain_path: text_content} for any file
+    the user attached to a "file"-type auto-detected field (see
+    main.py._pick_attachment) -- picked via SAF/copy_from_shared on our
+    side, then handed to Termux the same base64-content way as the
+    script itself, since Termux can't read anything we'd publish via
+    MediaStore. The stdin value fed for that field is the path it ends
+    up at here, so the script's own open(path) call finds it.
     """
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     script_path = f"{SCRIPTS_DIR}/{filename}"
     target = log_path or RUN_LOG
     args = " ".join(shlex.quote(str(a)) for a in (extra_args or []))
 
-    mkdir = f"mkdir -p {shlex.quote(SCRIPTS_DIR)} {shlex.quote(os.path.dirname(target))}"
-    write_script = f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(script_path)}"
+    mkdir_dirs = {SCRIPTS_DIR, os.path.dirname(target)}
+    write_parts = [f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(script_path)}"]
+
+    if attachments:
+        for path, text in attachments.items():
+            mkdir_dirs.add(os.path.dirname(path))
+            encoded_att = base64.b64encode(str(text).encode("utf-8", "replace")).decode("ascii")
+            write_parts.append(f"echo {shlex.quote(encoded_att)} | base64 -d > {shlex.quote(path)}")
 
     if stdin_values:
         stdin_payload = "\n".join(str(v) for v in stdin_values) + "\n"
         encoded_stdin = base64.b64encode(stdin_payload.encode("utf-8")).decode("ascii")
-        write_stdin = f"echo {shlex.quote(encoded_stdin)} | base64 -d > {shlex.quote(STDIN_FILE)} && "
+        write_parts.append(f"echo {shlex.quote(encoded_stdin)} | base64 -d > {shlex.quote(STDIN_FILE)}")
         stdin_redirect = f"< {shlex.quote(STDIN_FILE)}"
     else:
         # Redirect from /dev/null: RUN_COMMAND runs headless with nobody
@@ -107,11 +124,26 @@ def build_run_command_from_content(content, filename, extra_args=None, stdin_val
         # otherwise hang forever with zero output -- indistinguishable
         # from "still running a slow network call". This turns that into
         # an immediate, visible EOFError in the log instead.
-        write_stdin = ""
         stdin_redirect = "< /dev/null"
 
-    run = f"python {shlex.quote(script_path)} {args} {stdin_redirect}".strip()
-    return f"{mkdir} && {write_script} && {write_stdin}({run}) 2>&1 | tee {shlex.quote(target)}"
+    mkdir = f"mkdir -p {' '.join(shlex.quote(d) for d in mkdir_dirs)}"
+    write_all = " && ".join(write_parts)
+    run_inner = f"python {shlex.quote(script_path)} {args} {stdin_redirect}".strip()
+    # Backgrounded with its PID recorded so a later Stop action
+    # (build_stop_command) can kill it -- RUN_COMMAND is fire-and-forget
+    # and gives no other way to reach a process once it's running.
+    run = f"{run_inner} & echo $! > {shlex.quote(RUN_PID_FILE)}; wait"
+    return f"{mkdir} && {write_all} && ({run}) 2>&1 | tee {shlex.quote(target)}"
+
+
+def build_stop_command():
+    return (
+        f"if [ -f {shlex.quote(RUN_PID_FILE)} ]; then "
+        f"kill $(cat {shlex.quote(RUN_PID_FILE)}) 2>/dev/null "
+        f"&& echo 'Stop signal sent to the running script.' "
+        f"|| echo 'The script had already finished.'; "
+        f"else echo 'No running script is being tracked.'; fi"
+    )
 
 
 def config_path_for(script_name):
@@ -226,13 +258,24 @@ def install_packages(packages, log_path=None):
     return command
 
 
-def run_script_from_content(content, filename, extra_args=None, stdin_values=None, log_path=None):
+def run_script_from_content(content, filename, extra_args=None, stdin_values=None,
+                             attachments=None, log_path=None):
     """Run Script Action: Termux writes `content` to its own SCRIPTS_DIR
     and runs it with `python`."""
     command = build_run_command_from_content(
-        content, filename, extra_args, stdin_values=stdin_values, log_path=log_path
+        content, filename, extra_args, stdin_values=stdin_values,
+        attachments=attachments, log_path=log_path,
     )
     send_termux_command(command)
+    return command
+
+
+def stop_script():
+    """Best-effort kill of whatever Run Script last started (see the PID
+    file written in build_run_command_from_content). Sent quietly in the
+    background like save_config() -- there's no output to watch for."""
+    command = build_stop_command()
+    send_termux_command(command, background=True)
     return command
 
 
