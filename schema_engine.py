@@ -350,6 +350,18 @@ def _collect_print_menu(block, call_stmt_idx):
 
 _RAW_INPUT_CALL_RE = re.compile(r'\binput\s*\(')
 _RAW_NUMBER_TOKEN_RE = re.compile(r'(?<!\d)(\d{1,2})(?!\d)')
+# Short f-string colour placeholders scripts commonly alias colour codes
+# to, e.g. f"{C}[1] Gmail.com{W}" (C=Cyan, G=Green, W=White, M=Magenta,
+# R=Red/Reset, Y=Yellow, B=Blue...). Only meaningful here on raw,
+# unevaluated source text -- the AST paths either resolve a real f-string
+# placeholder properly or reject it outright, so they never see this
+# literal "{C}" text in the first place.
+_CURLY_VAR_RE = re.compile(r'\{[A-Za-z0-9_]+\}')
+# Catches a numbering prefix left at the very start of an already-built
+# label -- e.g. if the raw line itself repeated the number/bracket
+# ("[1][1] Gmail.com") -- so the final dropdown text never doubles up
+# the "1) " this module already adds itself.
+_LEADING_NUM_PREFIX_RE = re.compile(r'^[\[\(]?\d{1,2}[\]\)]?\s*[.\-:]?\s*')
 
 
 def _raw_line_menu_item(line):
@@ -371,6 +383,7 @@ def _raw_line_menu_item(line):
     text = re.sub(r'^print\s*\(', ' ', text)
     text = re.sub(r'\)\s*$', ' ', text)
     text = re.sub(r'''f?["']''', ' ', text)
+    text = _CURLY_VAR_RE.sub(' ', text)
 
     match = _RAW_NUMBER_TOKEN_RE.search(text)
     if not match:
@@ -380,6 +393,7 @@ def _raw_line_menu_item(line):
     label = text[:match.start()] + text[match.end():]
     label = re.sub(r'[\[\]()+,]+', ' ', label)
     label = re.sub(r'\s+', ' ', label).strip(' .:-')
+    label = _LEADING_NUM_PREFIX_RE.sub('', label).strip()
     if not label:
         return None, None
     return num, label
