@@ -156,11 +156,24 @@ def build_interactive_run_command(content, filename, extra_args=None, preset_ans
     # exits on its own, so that write end stays open for the script's
     # whole run, and every line later appended to `answers` (see
     # build_send_answer_command) gets relayed straight into the FIFO.
+    #
+    # `rm`/`mkfifo`/truncating `answers` run BEFORE anything is
+    # backgrounded, and the backgrounding itself is wrapped in its own
+    # `( ... )` group -- a bare trailing `&` on a full `&&`-chain like
+    # `rm -f X && mkfifo X && : > Y & echo ...` backgrounds the ENTIRE
+    # chain (rm/mkfifo/truncate included), not just the intended
+    # long-lived feeder loop. That raced mkfifo/truncation against the
+    # very next `&&`-chained step (starting the actual script with
+    # `< fifo`), which could try to open a FIFO that doesn't exist yet
+    # or read from an answers file that hasn't been truncated yet --
+    # exactly the kind of timing bug that produces unpredictable
+    # first-input behaviour. Confirmed by inspecting the generated
+    # command directly.
     setup = (
         f"rm -f {shlex.quote(fifo)} && mkfifo {shlex.quote(fifo)} && "
         f"{seed_answers} && "
-        f"( exec 3>{shlex.quote(fifo)}; tail -n +1 -f {shlex.quote(answers)} >&3 ) & "
-        f"echo $! > {shlex.quote(feed_pid)}"
+        f"( ( exec 3>{shlex.quote(fifo)}; tail -n +1 -f {shlex.quote(answers)} >&3 ) & "
+        f"echo $! > {shlex.quote(feed_pid)} )"
     )
 
     # -u / PYTHONUNBUFFERED: CPython block-buffers stdout once it isn't a

@@ -692,6 +692,14 @@ class RootWidget(BoxLayout):
 
     def _submit_answer(self, value):
         value = str(value)
+        if not value.strip():
+            # Only the manual Send button can reach this with an empty
+            # value (option/chip taps always pass a real one) -- refuse
+            # to feed a blank line into the script's stdin at all rather
+            # than send one and clear the step UI as if it had answered
+            # something.
+            self._show_message("Enter a value before sending.")
+            return
         self._collected_answers.append(value)
         self._append_output(f"[you] {value}\n")
         self._run_bridge_action(lambda: termux_bridge.send_answer(self._current_filename, value))
