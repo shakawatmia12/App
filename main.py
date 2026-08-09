@@ -188,14 +188,16 @@ class RootWidget(BoxLayout):
             from jnius import autoclass
 
             Intent = autoclass("android.content.Intent")
-            Settings = autoclass("android.provider.Settings")
             Uri = autoclass("android.net.Uri")
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
 
             activity = PythonActivity.mActivity
             package_name = activity.getPackageName()
 
-            intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+            # Use the raw action string instead of the Settings.* constant:
+            # pyjnius reflection doesn't reliably resolve that field on
+            # every device/ROM even when the OS itself supports it.
+            intent = Intent("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION")
             intent.setData(Uri.parse(f"package:{package_name}"))
             activity.startActivity(intent)
             self._append_output(
@@ -203,7 +205,29 @@ class RootWidget(BoxLayout):
                 "manage all files' on, then come back. One-time only.\n"
             )
         except Exception as exc:
-            self._append_output(f"[error] Could not open storage settings: {exc}\n")
+            self._append_output(
+                f"[warn] Direct toggle unavailable ({exc}).\n"
+                "[warn] Opening this app's settings page instead -- look for "
+                "'Files and media' / 'All files access' there.\n"
+            )
+            self._open_app_settings()
+
+    def _open_app_settings(self):
+        try:
+            from jnius import autoclass
+
+            Intent = autoclass("android.content.Intent")
+            Uri = autoclass("android.net.Uri")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+
+            activity = PythonActivity.mActivity
+            package_name = activity.getPackageName()
+
+            intent = Intent("android.settings.APPLICATION_DETAILS_SETTINGS")
+            intent.setData(Uri.parse(f"package:{package_name}"))
+            activity.startActivity(intent)
+        except Exception as exc:
+            self._append_output(f"[error] Could not open app settings either: {exc}\n")
 
     # ---- Script selection -------------------------------------------------
     def pick_script(self):
