@@ -252,6 +252,7 @@ class RootWidget(BoxLayout):
         # whether the step UI is currently up, and every answer given so
         # far this run (so Save Config can turn them into a preset).
         self._pending_chunk = ""
+        self._shown_chunk_len = 0
         self._quiet_ticks = 0
         self._awaiting_input = False
         self._collected_answers = []
@@ -412,6 +413,7 @@ class RootWidget(BoxLayout):
         self.run_button_text = "Run Script"
         self._collected_answers = []
         self._pending_chunk = ""
+        self._shown_chunk_len = 0
         self._quiet_ticks = 0
         self._awaiting_input = False
         self._clear_step_panel()
@@ -556,7 +558,7 @@ class RootWidget(BoxLayout):
         self._script_running = False
         self.run_button_text = "Run Script"
         self._awaiting_input = False
-        self._clear_step_panel()
+        self._show_finished_notice("Script Stopped")
         if self._poll_event:
             self._poll_event.cancel()
         self._set_status("Stop signal sent.", "warn")
@@ -591,6 +593,7 @@ class RootWidget(BoxLayout):
 
         self._collected_answers = []
         self._pending_chunk = ""
+        self._shown_chunk_len = 0
         self._quiet_ticks = 0
         self._awaiting_input = False
         self._clear_step_panel()
@@ -621,6 +624,15 @@ class RootWidget(BoxLayout):
         matter how the script's source built that text (colour codes,
         f-strings, a loop, argparse, anything)."""
         self._awaiting_input = True
+        # Remember exactly how much of _pending_chunk this UI was built
+        # from -- if the script prints its NEXT prompt before the user
+        # taps an answer to THIS one (a fast retry-validation loop, e.g.
+        # "Invalid selection, try again"), that new text keeps
+        # accumulating past this point. _submit_answer must only consume
+        # the part shown here, not wipe out that already-arrived next
+        # prompt too -- losing it meant the step UI could go blank
+        # forever with nothing left to detect the next prompt from.
+        self._shown_chunk_len = len(chunk)
         prompt = schema_engine.last_prompt_line(chunk)
         options, raw_values = schema_engine.parse_menu_options(chunk)
 
@@ -684,9 +696,21 @@ class RootWidget(BoxLayout):
         self._append_output(f"[you] {value}\n")
         self._run_bridge_action(lambda: termux_bridge.send_answer(self._current_filename, value))
         self._awaiting_input = False
-        self._pending_chunk = ""
+        # Keep anything that arrived AFTER the snapshot the current step
+        # UI was built from (see _show_step_ui) instead of discarding the
+        # whole buffer -- that leftover is the start of the script's NEXT
+        # prompt, already in hand.
+        self._pending_chunk = self._pending_chunk[self._shown_chunk_len:]
+        self._shown_chunk_len = 0
         self._quiet_ticks = 0
         self._clear_step_panel()
+
+    def _show_finished_notice(self, text):
+        panel = self.ids.get("step_panel") if hasattr(self, "ids") else None
+        if panel is None:
+            return
+        panel.clear_widgets()
+        panel.add_widget(self._step_label(text))
 
     def _check_termux_ready(self):
         """Verify Termux is actually installed before firing a command at
@@ -810,15 +834,15 @@ class RootWidget(BoxLayout):
             self._script_running = False
             self.run_button_text = "Run Script"
             self._awaiting_input = False
-            self._clear_step_panel()
+            self._show_finished_notice("Script Finished")
             if self._poll_event:
                 self._poll_event.cancel()
-            if self._collected_answers:
-                self._append_output(
-                    f"[run] Finished. {len(self._collected_answers)} answer(s) were "
-                    "given this run -- tap Save Config to store them as a reusable "
-                    "preset.\n"
-                )
+            note = (
+                f" {len(self._collected_answers)} answer(s) were given this run -- "
+                "tap Save Config to store them as a reusable preset."
+                if self._collected_answers else ""
+            )
+            self._append_output(f"[run] Script process has exited.{note}\n")
 
         def poll(_dt):
             content = reader()
@@ -837,7 +861,15 @@ class RootWidget(BoxLayout):
                 done = interactive and termux_bridge.DONE_MARKER in new_part
                 visible_part = new_part.replace(termux_bridge.DONE_MARKER, "") if done else new_part
                 if visible_part.strip():
-                    self._append_output(visible_part if visible_part.endswith("\n") else visible_part + "\n")
+                    # The terminal box should show the same text a human
+                    # would see in a real terminal, not raw escape bytes
+                    # like "\x1b[1;92m" -- parse_menu_options/
+                    # last_prompt_line already strip ANSI themselves when
+                    # reading _pending_chunk for menu detection, so the
+                    # raw (uncleaned) text is still what gets accumulated
+                    # there; only the *displayed* copy needs cleaning.
+                    clean_part = schema_engine.strip_ansi(visible_part)
+                    self._append_output(clean_part if clean_part.endswith("\n") else clean_part + "\n")
                     if interactive:
                         self._pending_chunk += visible_part
                         self._quiet_ticks = 0
