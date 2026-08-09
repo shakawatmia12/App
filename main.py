@@ -223,6 +223,7 @@ class RootWidget(BoxLayout):
         self.field_widgets = {}
         self._poll_event = None
         self._readable_script_path = ""
+        self._auto_input_fields = False
 
         if ON_ANDROID and SharedStorage is not None and Chooser is not None:
             self.shared_storage = SharedStorage()
@@ -404,19 +405,40 @@ class RootWidget(BoxLayout):
         self.script_path = readable_path
         self.script_name = display_name
         self._readable_script_path = readable_path
+        self._auto_input_fields = False
+
+        fields = schema_engine.get_fields(self.schema)
+        if not fields:
+            # No SCHEMA fields declared -- fall back to auto-detecting the
+            # script's own input() calls (same spirit as package
+            # auto-detection from imports) and building a form from those,
+            # instead of leaving the user with nothing to configure and a
+            # script that will hang forever waiting for typed input it can
+            # never receive under Termux's headless RUN_COMMAND.
+            detected_inputs = schema_engine.detect_inputs(readable_path)
+            if detected_inputs:
+                self.schema["fields"] = detected_inputs
+                self._auto_input_fields = True
+                fields = detected_inputs
 
         saved_values = self._load_saved_config()
         self._build_form(saved_values)
 
-        fields = schema_engine.get_fields(self.schema)
         self._append_output(f"[schema] Loaded '{self.schema.get('name')}' "
                              f"({len(fields)} fields, "
                              f"{len(schema_engine.get_packages(self.schema))} packages)\n")
-        if not fields:
-            # 0 fields almost always means the script itself has no
-            # top-level `SCHEMA = {...}` dict with a "fields" list (see
-            # schema_template.py) -- not something this app can conjure up
-            # on its own. Say so explicitly instead of leaving the user to
+        if self._auto_input_fields:
+            self._append_output(
+                f"[schema] No SCHEMA found, but auto-detected {len(fields)} input() "
+                "prompt(s) in this script. Fill them in below -- Run Script will feed "
+                "your answers to the script in the same order they appear in its code. "
+                "This is a best-effort guess: if the script's questions change "
+                "depending on an earlier menu choice, these fields may not match "
+                "exactly what actually gets asked.\n"
+            )
+        elif not fields:
+            # Truly nothing to go on: no SCHEMA and no input() calls found
+            # either. Say so explicitly instead of leaving the user to
             # guess why "No configurable options" is showing.
             self._append_output(
                 f"[schema] {self.schema.get('description', '')} "
@@ -619,9 +641,22 @@ class RootWidget(BoxLayout):
             return
 
         filename = os.path.basename(self._readable_script_path)
+
+        stdin_values = None
+        if self._auto_input_fields:
+            # Feed the form's answers to the script's own input() calls, in
+            # the same source order schema_engine.detect_inputs found them.
+            values = self._collect_form_values()
+            stdin_values = [str(values.get(f["key"], "")) for f in schema_engine.get_fields(self.schema)]
+            self._append_output(
+                f"[run] Feeding {len(stdin_values)} answer(s) to the script's input() calls...\n"
+            )
+
         self._append_output(f"[run] Launching {self.script_name} in Termux...\n")
         self._set_status("Sending Run Script command to Termux...", "info")
-        if not self._run_bridge_action(lambda: termux_bridge.run_script_from_content(content, filename)):
+        if not self._run_bridge_action(
+            lambda: termux_bridge.run_script_from_content(content, filename, stdin_values=stdin_values)
+        ):
             return
         self._set_status("Sent -- waiting for Termux output...", "info")
         # A longer grace period than Install Packages: user scripts can make

@@ -73,10 +73,20 @@ def build_install_command(packages, log_path=None):
     return f"{mkdir} && ({body}) 2>&1 | tee {shlex.quote(target)}"
 
 
-def build_run_command_from_content(content, filename, extra_args=None, log_path=None):
+STDIN_FILE = f"{SCRIPTS_DIR}/_last_run_stdin.txt"
+
+
+def build_run_command_from_content(content, filename, extra_args=None, stdin_values=None, log_path=None):
     """Have Termux write the script's content to a path it owns, then run
     it -- see the module docstring for why we hand Termux content instead
     of a path we published via MediaStore.
+
+    stdin_values: when the script has no SCHEMA and main.py auto-detected
+    its input() calls (schema_engine.detect_inputs), this is the user's
+    answers in the same source order those calls appear in. They're
+    written to a plain file and redirected in as stdin, so the script's
+    own input() calls read them exactly as if someone had typed them --
+    without stdin_values, we redirect from /dev/null instead (see below).
     """
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     script_path = f"{SCRIPTS_DIR}/{filename}"
@@ -85,13 +95,23 @@ def build_run_command_from_content(content, filename, extra_args=None, log_path=
 
     mkdir = f"mkdir -p {shlex.quote(SCRIPTS_DIR)} {shlex.quote(os.path.dirname(target))}"
     write_script = f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(script_path)}"
-    # Redirect stdin from /dev/null: RUN_COMMAND runs headless with nobody
-    # able to type into it, so a script that calls input() would otherwise
-    # hang forever with zero output -- indistinguishable from "still
-    # running a slow network call". This turns that into an immediate,
-    # visible EOFError in the log instead, which is at least diagnosable.
-    run = f"python {shlex.quote(script_path)} {args} < /dev/null".strip()
-    return f"{mkdir} && {write_script} && ({run}) 2>&1 | tee {shlex.quote(target)}"
+
+    if stdin_values:
+        stdin_payload = "\n".join(str(v) for v in stdin_values) + "\n"
+        encoded_stdin = base64.b64encode(stdin_payload.encode("utf-8")).decode("ascii")
+        write_stdin = f"echo {shlex.quote(encoded_stdin)} | base64 -d > {shlex.quote(STDIN_FILE)} && "
+        stdin_redirect = f"< {shlex.quote(STDIN_FILE)}"
+    else:
+        # Redirect from /dev/null: RUN_COMMAND runs headless with nobody
+        # able to type into it, so a script that calls input() would
+        # otherwise hang forever with zero output -- indistinguishable
+        # from "still running a slow network call". This turns that into
+        # an immediate, visible EOFError in the log instead.
+        write_stdin = ""
+        stdin_redirect = "< /dev/null"
+
+    run = f"python {shlex.quote(script_path)} {args} {stdin_redirect}".strip()
+    return f"{mkdir} && {write_script} && {write_stdin}({run}) 2>&1 | tee {shlex.quote(target)}"
 
 
 def config_path_for(script_name):
@@ -206,10 +226,12 @@ def install_packages(packages, log_path=None):
     return command
 
 
-def run_script_from_content(content, filename, extra_args=None, log_path=None):
+def run_script_from_content(content, filename, extra_args=None, stdin_values=None, log_path=None):
     """Run Script Action: Termux writes `content` to its own SCRIPTS_DIR
     and runs it with `python`."""
-    command = build_run_command_from_content(content, filename, extra_args, log_path=log_path)
+    command = build_run_command_from_content(
+        content, filename, extra_args, stdin_values=stdin_values, log_path=log_path
+    )
     send_termux_command(command)
     return command
 

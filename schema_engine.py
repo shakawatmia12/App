@@ -196,6 +196,68 @@ def detect_imports(script_path):
     return sorted(m for m in modules if m and m not in stdlib)
 
 
+def _extract_prompt_text(call_node):
+    """Best-effort extraction of an input() call's prompt string, so the
+    auto-generated field has a useful label instead of a generic one."""
+    if not call_node.args:
+        return ""
+
+    arg = call_node.args[0]
+    try:
+        return str(ast.literal_eval(arg)).strip()
+    except (ValueError, TypeError):
+        pass
+
+    if isinstance(arg, ast.JoinedStr):  # f-string with only literal pieces
+        parts = [
+            value.value for value in arg.values
+            if isinstance(value, ast.Constant) and isinstance(value.value, str)
+        ]
+        return "".join(parts).strip()
+
+    return ""
+
+
+def detect_inputs(script_path):
+    """Best-effort scan for input() calls, in source order, used to build
+    a settings form automatically when a script has no SCHEMA of its own.
+
+    This is a heuristic, not a real interpreter: it finds every input()
+    call anywhere in the file -- including ones inside if/elif branches
+    or loops -- and turns each into one text field, in source order. It
+    cannot know which branch actually executes at runtime, so a script
+    whose questions depend on an earlier menu choice may end up with
+    extra/mismatched fields. It works well for scripts that just ask a
+    flat, unconditional sequence of questions.
+    """
+    try:
+        with open(script_path, "r", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=script_path)
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return []
+
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "input"
+    ]
+    calls.sort(key=lambda n: (n.lineno, n.col_offset))
+
+    fields = []
+    for i, call in enumerate(calls, start=1):
+        prompt = _extract_prompt_text(call)
+        fields.append({
+            "key": f"input_{i}",
+            "type": "text",
+            "label": prompt or f"Input #{i}",
+            "default": "",
+            "required": False,
+        })
+    return fields
+
+
 # ---- Per-script config helpers (platform-agnostic) ---------------------
 
 def sanitize_name(name):
