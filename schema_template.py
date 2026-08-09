@@ -60,21 +60,20 @@ SCHEMA = {
 
 
 def load_saved_config():
-    """Read this script's own saved settings back from shared storage.
+    """Read this script's own saved settings back from Termux's own dir.
 
     The wrapper app's "Save Config" delegates the actual write to Termux
-    (its own process is scoped-storage-restricted on Android 10+ and
-    can't reliably write shared paths itself), landing at
-    /storage/emulated/0/Documents/<APP_TITLE>/configs/<sanitized script
-    name>_config.json. Must match main.py's APP_TITLE and
-    schema_engine.sanitize_name()/config_filename_for() exactly.
+    (Termux writes its own plain files with no restriction; the wrapper
+    app's process is scoped-storage-restricted on Android 10+ and can't
+    reliably write shared paths itself), landing at
+    /sdcard/termux_wrapper/configs/<sanitized script name>_config.json.
+    Must match termux_bridge.config_path_for()/schema_engine.
+    sanitize_name() exactly.
     """
     import json
     import os
     import re
     import sys
-
-    app_title = "Script Wrapper"  # must match buildozer.spec's [app] title
 
     def sanitize_name(name):
         stem = os.path.splitext(name or "script")[0]
@@ -82,7 +81,7 @@ def load_saved_config():
         return cleaned or "script"
 
     script_name = sanitize_name(os.path.basename(sys.argv[0]))
-    config_path = f"/storage/emulated/0/Documents/{app_title}/configs/{script_name}_config.json"
+    config_path = f"/sdcard/termux_wrapper/configs/{script_name}_config.json"
 
     if not os.path.isfile(config_path):
         return {}

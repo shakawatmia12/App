@@ -10,13 +10,21 @@ Design notes
   Explicit component intents are exempt from Android 11+ package-visibility
   filtering, so no `<queries>` manifest entry is required.
 * Termux's RUN_COMMAND intent does not stream stdout back to the caller in
-  real time. To give the wrapper app a "Terminal Output Stream View" without
-  a custom Java BroadcastReceiver, every command is wrapped with
-  `... 2>&1 | tee <logfile>` and the app polls that logfile from Python.
+  real time. Every command is wrapped with `... 2>&1 | tee <logfile>` and
+  the app polls that logfile from Python (best-effort -- see read_log()).
 * The user must enable `allow-external-apps=true` in
   `~/.termux/termux.properties` inside Termux itself, or Termux will
-  silently refuse the RUN_COMMAND intent. See build_instructions.md-style
-  notes at the end of buildozer.spec / project README for the full checklist.
+  silently refuse the RUN_COMMAND intent.
+* Confirmed on a real device: Termux cannot read/write files our own app
+  publishes into a MediaStore collection via androidstorage4kivy's
+  copy_to_shared() ("Permission denied" trying to `bash` a script placed
+  there), even though Termux has its own broad legacy storage access
+  everywhere else. So every script/config Termux needs to read or write
+  is transferred as base64-encoded CONTENT embedded directly in the shell
+  command -- Termux decodes and writes it into a plain path it owns
+  itself (under LOG_DIR), never touching anything our app inserted via
+  MediaStore. Only reading files *for our own process* (schema parsing)
+  goes through copy_from_shared(), which stays entirely on our side.
 """
 import base64
 import json
@@ -29,11 +37,12 @@ TERMUX_ACTION = "com.termux.RUN_COMMAND"
 TERMUX_BASH = "/data/data/com.termux/files/usr/bin/bash"
 TERMUX_HOME = "/data/data/com.termux/files/home"
 
-# Termux writes everything here with its own full storage access -- this
-# directory does NOT need to exist beforehand from our side, since our own
-# app can't reliably create/write shared-storage paths under Android 10+
-# scoped storage. Every command below `mkdir -p`s it itself.
+# Termux writes and reads everything here with its own full storage access.
+# This directory does NOT need to exist beforehand from our side -- every
+# command below `mkdir -p`s it itself.
 LOG_DIR = "/sdcard/termux_wrapper"
+SCRIPTS_DIR = f"{LOG_DIR}/scripts"
+CONFIGS_DIR = f"{LOG_DIR}/configs"
 INSTALL_LOG = f"{LOG_DIR}/install_output.log"
 RUN_LOG = f"{LOG_DIR}/run_output.log"
 
@@ -42,24 +51,16 @@ RUN_LOG = f"{LOG_DIR}/run_output.log"
 # from any other app. No app -- including this one -- can write into
 # Termux's private storage to flip that flag for the user (that's the
 # whole point of the setting: it's a deliberate, user-only opt-in gate).
-# The best we can do is make the one-time paste as short as possible.
 SETUP_COMMAND = (
     "mkdir -p ~/.termux && "
-    "(grep -q allow-external-apps ~/.termux/termux.properties 2>/dev/null || "
-    "echo 'allow-external-apps=true' >> ~/.termux/termux.properties) && "
+    "echo 'allow-external-apps=true' >> ~/.termux/termux.properties && "
     "termux-reload-settings && termux-setup-storage && "
     "echo 'Termux is ready for Script Wrapper.'"
 )
 
 
 def build_install_command(packages, log_path=None):
-    """Return the shell command that installs python + pip packages.
-
-    `log_path` should be a real path our own app can also read back (see
-    main.py's _prepare_shared_log) -- Termux's plain-filesystem write to
-    the default LOG_DIR works fine for Termux itself, but our own process
-    can't read that path back under Android 10+ scoped storage.
-    """
+    """Return the shell command that installs python + pip packages."""
     pkg_list = " ".join(shlex.quote(p) for p in packages if p)
 
     if pkg_list:
@@ -72,36 +73,39 @@ def build_install_command(packages, log_path=None):
     return f"{mkdir} && ({body}) 2>&1 | tee {shlex.quote(target)}"
 
 
-def build_run_command(script_path, extra_args=None, log_path=None):
-    """Return the shell command that runs the selected script in Termux."""
-    if not script_path:
-        raise ValueError("script_path is required")
-
-    quoted_script = shlex.quote(script_path)
-    args = " ".join(shlex.quote(str(a)) for a in (extra_args or []))
-    body = f"python {quoted_script} {args}".strip()
-
-    target = log_path or RUN_LOG
-    mkdir = f"mkdir -p {shlex.quote(os.path.dirname(target))}"
-    return f"{mkdir} && ({body}) 2>&1 | tee {shlex.quote(target)}"
-
-
-def build_save_config_command(config_path, values):
-    """Have Termux itself write the config file at `config_path`.
-
-    Our own app's process is scoped-storage-restricted on Android 10+ and
-    can't reliably write arbitrary shared-storage paths, but Termux
-    already has full storage access via `termux-setup-storage`. Values
-    are base64-encoded so arbitrary JSON (quotes, newlines) survives
-    shell-command quoting unscathed. `config_path` is resolved by the
-    caller (see main.py's _ensure_config_registered / _config_real_path),
-    since only it knows the SAF-published real path our own process can
-    later read back with copy_from_shared().
+def build_run_command_from_content(content, filename, extra_args=None, log_path=None):
+    """Have Termux write the script's content to a path it owns, then run
+    it -- see the module docstring for why we hand Termux content instead
+    of a path we published via MediaStore.
     """
+    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    script_path = f"{SCRIPTS_DIR}/{filename}"
+    target = log_path or RUN_LOG
+    args = " ".join(shlex.quote(str(a)) for a in (extra_args or []))
+
+    mkdir = f"mkdir -p {shlex.quote(SCRIPTS_DIR)} {shlex.quote(os.path.dirname(target))}"
+    write_script = f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(script_path)}"
+    run = f"python {shlex.quote(script_path)} {args}".strip()
+    return f"{mkdir} && {write_script} && ({run}) 2>&1 | tee {shlex.quote(target)}"
+
+
+def config_path_for(script_name):
+    import schema_engine
+
+    return f"{CONFIGS_DIR}/{schema_engine.config_filename_for(script_name)}"
+
+
+def build_save_config_command(script_name, values):
+    """Have Termux write the config file under its own CONFIGS_DIR.
+
+    Values are base64-encoded so arbitrary JSON (quotes, newlines)
+    survives shell-command quoting unscathed.
+    """
+    config_path = config_path_for(script_name)
     payload = json.dumps(values, indent=2, ensure_ascii=False)
     encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
 
-    mkdir = f"mkdir -p {shlex.quote(os.path.dirname(config_path))}"
+    mkdir = f"mkdir -p {shlex.quote(CONFIGS_DIR)}"
     write = f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(config_path)}"
     return f"{mkdir} && {write} && echo 'Config saved to {config_path}'"
 
@@ -169,16 +173,17 @@ def install_packages(packages, log_path=None):
     return command
 
 
-def run_script(script_path, extra_args=None, log_path=None):
-    """Run Script Action: python /sdcard/selected_script.py in a Termux session."""
-    command = build_run_command(script_path, extra_args, log_path=log_path)
+def run_script_from_content(content, filename, extra_args=None, log_path=None):
+    """Run Script Action: Termux writes `content` to its own SCRIPTS_DIR
+    and runs it with `python`."""
+    command = build_run_command_from_content(content, filename, extra_args, log_path=log_path)
     send_termux_command(command)
     return command
 
 
-def save_config(config_path, values):
+def save_config(script_name, values):
     """Save Config Action: delegate the actual file write to Termux."""
-    command = build_save_config_command(config_path, values)
+    command = build_save_config_command(script_name, values)
     send_termux_command(command, background=True)
     return command
 
@@ -221,6 +226,13 @@ def is_termux_installed():
 
 
 def read_log(log_path):
+    """Best-effort direct read of a plain path Termux wrote to. On
+    Android 10+ scoped storage this can fail silently (returns "") for
+    our own process even though the file exists and Termux can see it
+    fine -- there is no in-app workaround for that short of
+    MANAGE_EXTERNAL_STORAGE, so callers should treat empty as
+    "unknown/check Termux directly", not "nothing happened yet".
+    """
     if not os.path.isfile(log_path):
         return ""
     try:

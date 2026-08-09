@@ -37,12 +37,21 @@ except ImportError:
 # 3) androidstorage4kivy's Chooser hands back the original SAF content
 #    reference (not a resolved path), and copy_from_shared() reads it via
 #    ContentResolver under the picker's own permission grant, bypassing
-#    scoped storage entirely for OUR read. copy_to_shared() then publishes
-#    the file into a public MediaStore collection, which lands as a real
-#    file on disk that Termux (full, unrestricted storage access) can run
-#    directly -- Termux was never the problem, our own process reading
-#    arbitrary paths was. The same trick is reused for live log output
-#    and per-script saved config below.
+#    scoped storage entirely -- but only for OUR OWN process. It is NOT a
+#    way to hand files to Termux: publishing a file into a MediaStore
+#    collection via copy_to_shared() and pointing Termux at that path
+#    fails with "Permission denied" (confirmed on device) -- Termux
+#    can't read entries our app owns in MediaStore, even though it has
+#    full plain-filesystem access everywhere else (its own home dir, and
+#    any plain path under /sdcard it creates itself). So:
+#      - reading a picked file for OUR OWN purposes (schema parsing,
+#        import detection) uses copy_from_shared() into our private cache.
+#      - anything TERMUX needs to read or write (the script to run, its
+#        saved config, the one-time setup command) is transferred as
+#        base64-encoded CONTENT embedded in the shell command itself, so
+#        Termux writes it into a plain path under its own control
+#        (termux_bridge.LOG_DIR and friends) and never has to touch
+#        anything our app inserted into MediaStore.
 try:
     from androidstorage4kivy import Chooser, SharedStorage
 except ImportError:
@@ -180,12 +189,6 @@ KV = """
             padding: dp(6), dp(6)
 """
 
-# Must match buildozer.spec's [app] `title` -- androidstorage4kivy nests
-# every shared path under this app-title segment and there's no API to
-# ask it for that value from outside a running app instance, so scripts
-# reading their own config back (see schema_template.py) hardcode it too.
-APP_TITLE = "Script Wrapper"
-
 
 class RootWidget(BoxLayout):
     script_path = StringProperty("")
@@ -208,66 +211,32 @@ class RootWidget(BoxLayout):
 
     # ---- One-time Termux setup -------------------------------------------
     def setup_termux(self):
-        """Bring Termux to the front with the shortest possible command on
-        the clipboard for the user to paste there.
+        """Copy the setup command and bring Termux to the front.
 
         Termux refuses RUN_COMMAND intents from other apps until
         `allow-external-apps=true` is set inside its own private
         ~/.termux/termux.properties. No app can write that file for the
-        user (that's Termux's whole point). Pasting our full multi-command
-        setup line directly kept getting corrupted by a bracketed-paste
-        glitch on a real test device (confirmed: literal `^[[200~` escape
-        bytes leaking into the shell and breaking the first word of the
-        command, so nothing after it ran either). Publishing the setup
-        logic as a small script file via the same SAF mechanism used for
-        scripts, and only asking the user to paste a short `bash "<path>"`
-        line, leaves much less for a flaky paste to corrupt.
+        user (that's Termux's whole point), so the best we can offer is:
+        copy the command, open Termux, and let the user paste + Enter.
+        (An earlier version tried publishing this as a script file via
+        copy_to_shared() and pasting a short `bash "<path>"` instead, to
+        dodge a paste-corruption glitch seen on one device -- but Termux
+        can't read files published that way at all, confirmed separately,
+        so that approach is out. The plain command is self-contained: it
+        only ever touches Termux's own home directory.)
         """
-        command_to_paste = termux_bridge.SETUP_COMMAND
-        if self.shared_storage is not None:
-            published_path = self._publish_setup_script()
-            if published_path:
-                command_to_paste = f'bash "{published_path}"'
-
-        Clipboard.copy(command_to_paste)
+        Clipboard.copy(termux_bridge.SETUP_COMMAND)
         self._append_output(
             "[setup] Command copied to clipboard.\n"
             "[setup] Termux is opening -- long-press to Paste, then press Enter.\n"
-            "[setup] If the pasted line looks garbled/broken, don't run it -- "
-            "clear the line and type it by hand instead (it's short now).\n"
+            "[setup] If the pasted line looks garbled/broken (stray characters "
+            "at the start), clear it and type it by hand instead.\n"
             "[setup] You only need to do this once.\n"
         )
         try:
             termux_bridge.open_termux()
         except Exception as exc:
             self._append_output(f"{self._friendly_error(exc)}\n")
-
-    def _publish_setup_script(self):
-        """Write SETUP_COMMAND to a small script file and publish it via
-        copy_to_shared(), so Termux only needs `bash "<real_path>"` typed
-        or pasted instead of the full multi-command line. Returns the real
-        path, or None if publishing failed (caller falls back to the full
-        command)."""
-        try:
-            from jnius import autoclass
-
-            Environment = autoclass("android.os.Environment")
-            cache_dir = self.shared_storage.get_cache_dir()
-            private_path = os.path.join(cache_dir, "setup.sh")
-            with open(private_path, "w", encoding="utf-8") as f:
-                f.write(termux_bridge.SETUP_COMMAND)
-
-            shared_uri = self.shared_storage.copy_to_shared(
-                private_path,
-                collection=Environment.DIRECTORY_DOCUMENTS,
-                filepath="setup.sh",
-            )
-            return self._uri_to_real_path(shared_uri) if shared_uri else None
-        except Exception as exc:
-            self._append_output(
-                f"[warn] Could not publish setup script ({exc}); using the full command instead.\n"
-            )
-            return None
 
     # ---- Storage access (Android 11+ scoped storage) ----------------------
     def request_storage_access(self):
@@ -348,11 +317,12 @@ class RootWidget(BoxLayout):
         Clock.schedule_once(lambda dt: self._handle_picked_file(shared_file_list[0]))
 
     def _handle_picked_file(self, shared_file):
-        """Read a SAF-picked file via androidstorage4kivy, then publish it
-        to public shared storage so Termux can run it by real path.
-
-        See the module-level NOTE above the imports for why this two-step
-        copy is necessary instead of just using a resolved path.
+        """Read a SAF-picked file into our own private cache via
+        androidstorage4kivy. That private copy is used for everything OUR
+        OWN process needs to do with it (schema parsing, import
+        detection) AND is what gets read fresh and embedded as content
+        when Termux needs to run it -- see the module-level NOTE above the
+        imports for why we don't hand Termux a path instead.
         """
         try:
             private_path = self.shared_storage.copy_from_shared(shared_file)
@@ -374,84 +344,7 @@ class RootWidget(BoxLayout):
             self._show_message(self._friendly_error(exc))
             return
 
-        try:
-            from jnius import autoclass
-
-            Environment = autoclass("android.os.Environment")
-            shared_uri = self.shared_storage.copy_to_shared(
-                private_path, collection=Environment.DIRECTORY_DOCUMENTS
-            )
-        except Exception as exc:
-            self._append_output(f"[error] Could not publish script for Termux: {exc}\n")
-            return
-        if not shared_uri:
-            self._append_output("[error] Could not publish script for Termux (no reference returned).\n")
-            return
-
-        run_path = self._uri_to_real_path(shared_uri)
-        if not run_path:
-            self._append_output(
-                f"[error] Published the script but couldn't resolve its real path "
-                f"(got: {shared_uri!r}). Termux can't run a content:// reference directly.\n"
-            )
-            return
-
-        self._apply_loaded_script(schema, run_path, filename, readable_path=private_path)
-        self._append_output(f"[schema] Termux will run: {run_path}\n")
-
-    def _uri_to_real_path(self, uri):
-        """Resolve a MediaStore content Uri (returned by copy_to_shared) to
-        a real absolute filesystem path Termux can open directly.
-
-        copy_to_shared() returns an android.net.Uri object, not a path
-        string as some library examples implied -- confirmed on a real
-        device (str(uri) showed the Java object repr). MediaStore's "_data"
-        column still holds a real path for local primary-storage files on
-        most devices; RELATIVE_PATH + DISPLAY_NAME is the fallback for
-        devices where "_data" comes back empty.
-        """
-        try:
-            from jnius import autoclass
-        except ImportError:
-            return None
-
-        PythonActivity = autoclass("org.kivy.android.PythonActivity")
-        resolver = PythonActivity.mActivity.getContentResolver()
-
-        def query_columns(columns):
-            try:
-                cursor = resolver.query(uri, columns, None, None, None)
-            except Exception:
-                # jnius doesn't always auto-convert a python list to the
-                # Java String[] this overload expects -- build one by hand.
-                try:
-                    cursor = resolver.query(uri, termux_bridge._to_java_string_array(columns), None, None, None)
-                except Exception:
-                    return {}
-            if cursor is None:
-                return {}
-            try:
-                if not cursor.moveToFirst():
-                    return {}
-                result = {}
-                for col in columns:
-                    idx = cursor.getColumnIndex(col)
-                    if idx >= 0:
-                        result[col] = cursor.getString(idx)
-                return result
-            finally:
-                cursor.close()
-
-        row = query_columns(["_data"])
-        if row.get("_data"):
-            return row["_data"]
-
-        row = query_columns(["_display_name", "relative_path"])
-        if row.get("_display_name"):
-            rel = row.get("relative_path") or ""
-            return f"/storage/emulated/0/{rel}{row['_display_name']}"
-
-        return None
+        self._apply_loaded_script(schema, private_path, filename)
 
     def load_manual_path(self, path):
         path = path.strip()
@@ -468,9 +361,9 @@ class RootWidget(BoxLayout):
 
     def _load_script_from_plain_path(self, path):
         """Used by the manual path box and the plyer fallback picker: reads
-        and runs the same plain path directly, no shared-storage copy.
-        Works when the device doesn't enforce scoped storage, or when
-        'Grant Storage Access' (MANAGE_EXTERNAL_STORAGE) has been granted.
+        the same plain path directly, no shared-storage copy. Works when
+        the device doesn't enforce scoped storage, or when 'Grant Storage
+        Access' (MANAGE_EXTERNAL_STORAGE) has been granted.
         """
         if not path.lower().endswith(".py"):
             self._show_message(f"'{os.path.basename(path)}' is not a .py file. Pick a Python script.")
@@ -484,11 +377,11 @@ class RootWidget(BoxLayout):
 
         self._apply_loaded_script(schema, path, os.path.basename(path))
 
-    def _apply_loaded_script(self, schema, run_path, display_name, readable_path=None):
+    def _apply_loaded_script(self, schema, readable_path, display_name):
         self.schema = schema
-        self.script_path = run_path
+        self.script_path = readable_path
         self.script_name = display_name
-        self._readable_script_path = readable_path or run_path
+        self._readable_script_path = readable_path
 
         saved_values = self._load_saved_config()
         self._build_form(saved_values)
@@ -499,67 +392,21 @@ class RootWidget(BoxLayout):
         if saved_values:
             self._append_output(f"[config] Restored previously saved settings for '{self.script_name}'.\n")
 
-    # ---- Per-script config: paths, load, reset -----------------------------
-    def _config_relative_ref(self):
-        filename = schema_engine.config_filename_for(self.script_name)
-        return f"Documents/{APP_TITLE}/configs/{filename}"
-
-    def _config_real_path(self):
-        return f"/storage/emulated/0/{self._config_relative_ref()}"
-
+    # ---- Per-script config: load, reset -----------------------------
     def _load_saved_config(self):
         """Best-effort read of this script's previously saved settings.
 
-        Uses copy_from_shared() the same way _handle_picked_file does for
-        scripts -- a plain path read would hit the same scoped-storage
-        wall on Android 10+ that broke file picking originally.
+        Termux owns this file (plain path under termux_bridge.CONFIGS_DIR,
+        written by save_config()'s embedded-content command) -- our own
+        process reading it directly can fail silently on Android 10+
+        scoped storage, in which case this just returns {} and the form
+        starts from schema defaults. Save Config itself is unaffected
+        either way: it doesn't depend on this read succeeding.
         """
         if not self.script_name:
             return {}
-        if self.shared_storage is None:
-            return schema_engine.load_json_file(self._config_real_path())
-        try:
-            private_copy = self.shared_storage.copy_from_shared(self._config_relative_ref())
-        except Exception:
-            return {}
-        return schema_engine.load_json_file(private_copy)
-
-    def _ensure_config_registered(self):
-        """Make sure this script's config file exists as a MediaStore entry
-        before Termux writes into it, so a later copy_from_shared() can
-        find it -- otherwise a file Termux creates via plain shell redirect
-        may never get indexed and reads for it will keep coming back empty.
-        Returns the real path Termux should write to.
-        """
-        real_path = self._config_real_path()
-        if self.shared_storage is None:
-            return real_path
-
-        try:
-            already_there = self.shared_storage.copy_from_shared(self._config_relative_ref())
-        except Exception:
-            already_there = None
-        if already_there:
-            return real_path
-
-        try:
-            from jnius import autoclass
-
-            Environment = autoclass("android.os.Environment")
-            cache_dir = self.shared_storage.get_cache_dir()
-            filename = schema_engine.config_filename_for(self.script_name)
-            placeholder = os.path.join(cache_dir, filename)
-            with open(placeholder, "w", encoding="utf-8") as f:
-                f.write("{}")
-            self.shared_storage.copy_to_shared(
-                placeholder,
-                collection=Environment.DIRECTORY_DOCUMENTS,
-                filepath=f"configs/{filename}",
-            )
-        except Exception as exc:
-            self._append_output(f"[warn] Could not prepare config storage ({exc}).\n")
-
-        return real_path
+        config_path = termux_bridge.config_path_for(self.script_name)
+        return schema_engine.load_json_file(config_path)
 
     def show_script_options(self):
         if not self.script_path:
@@ -590,21 +437,18 @@ class RootWidget(BoxLayout):
             self._show_message("Select a script first.")
             return
 
-        if self.shared_storage is not None:
-            try:
-                self.shared_storage.delete_shared(self._config_relative_ref())
-            except Exception as exc:
-                self._append_output(f"[warn] Could not delete saved config: {exc}\n")
-        else:
-            real_path = self._config_real_path()
-            try:
-                if os.path.isfile(real_path):
-                    os.remove(real_path)
-            except OSError as exc:
-                self._append_output(f"[warn] Could not delete saved config: {exc}\n")
+        config_path = termux_bridge.config_path_for(self.script_name)
+        try:
+            if os.path.isfile(config_path):
+                os.remove(config_path)
+        except OSError:
+            pass  # scoped storage may block this from our side; harmless
 
         self._build_form({})
-        self._append_output(f"[config] Reset saved settings for '{self.script_name}'.\n")
+        self._append_output(
+            f"[config] Reset form to defaults for '{self.script_name}' "
+            f"(the saved file at {config_path} will be overwritten next Save Config).\n"
+        )
 
     # ---- Dynamic form -------------------------------------------------
     def _build_form(self, saved_values=None):
@@ -687,9 +531,9 @@ class RootWidget(BoxLayout):
             return False
 
         values = self._collect_form_values()
-        config_path = self._ensure_config_registered()
+        config_path = termux_bridge.config_path_for(self.script_name)
         self._append_output(f"[config] Saving settings to {config_path} via Termux...\n")
-        self._run_bridge_action(lambda: termux_bridge.save_config(config_path, values))
+        self._run_bridge_action(lambda: termux_bridge.save_config(self.script_name, values))
         return True
 
     def install_packages(self):
@@ -713,10 +557,8 @@ class RootWidget(BoxLayout):
             f"[install] Requesting install of: {', '.join(packages) or '(none found)'}{note}\n"
         )
 
-        log_path, poll = self._start_log_poll("install_output.log")
-        self._run_bridge_action(lambda: termux_bridge.install_packages(packages, log_path=log_path))
-        if poll:
-            self._start_polling(poll)
+        self._run_bridge_action(lambda: termux_bridge.install_packages(packages))
+        self._start_polling(termux_bridge.read_install_log)
 
     def run_script(self):
         if not self.script_path:
@@ -726,11 +568,20 @@ class RootWidget(BoxLayout):
             return
         if not self.save_config():
             return
+
+        try:
+            with open(self._readable_script_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except OSError as exc:
+            self._append_output(f"{self._friendly_error(exc)}\n")
+            return
+
+        filename = os.path.basename(self._readable_script_path)
         self._append_output(f"[run] Launching {self.script_name} in Termux...\n")
-        log_path, poll = self._start_log_poll("run_output.log")
-        self._run_bridge_action(lambda: termux_bridge.run_script(self.script_path, log_path=log_path))
-        if poll:
-            self._start_polling(poll)
+        self._run_bridge_action(
+            lambda: termux_bridge.run_script_from_content(content, filename)
+        )
+        self._start_polling(termux_bridge.read_run_log)
 
     def _check_termux_ready(self):
         """Verify Termux is actually installed before firing a command at
@@ -748,59 +599,6 @@ class RootWidget(BoxLayout):
             "it from F-Droid or GitHub Releases (not Play Store).\n"
         )
         return False
-
-    def _start_log_poll(self, filename):
-        """Publish an (initially empty) log file to shared storage so
-        Termux can write into a real path and our own process can still
-        read it back afterward -- see _handle_picked_file's docstring for
-        why a plain shared path can't just be read directly.
-
-        Returns (log_path_for_termux, poll_callable). If shared storage
-        isn't available (non-Android, or the library failed to import),
-        falls back to the old fixed /sdcard/termux_wrapper path and reads
-        it directly -- works fine on pre-scoped-storage Android, silently
-        won't show anything in-app on Android 10+ without it.
-        """
-        if self.shared_storage is None:
-            return None, termux_bridge.read_run_log if "run" in filename else termux_bridge.read_install_log
-
-        try:
-            from jnius import autoclass
-
-            Environment = autoclass("android.os.Environment")
-            cache_dir = self.shared_storage.get_cache_dir()
-            private_path = os.path.join(cache_dir, filename)
-            with open(private_path, "w", encoding="utf-8"):
-                pass
-
-            shared_uri = self.shared_storage.copy_to_shared(
-                private_path, collection=Environment.DIRECTORY_DOCUMENTS
-            )
-            real_path = self._uri_to_real_path(shared_uri) if shared_uri else None
-        except Exception as exc:
-            self._append_output(f"[warn] Live output unavailable ({exc}); check Termux directly.\n")
-            return None, None
-
-        if not real_path:
-            self._append_output("[warn] Live output unavailable (couldn't resolve shared path); check Termux directly.\n")
-            return None, None
-
-        relative_ref = real_path.replace("/storage/emulated/0/", "", 1)
-
-        def poll():
-            try:
-                fresh_copy = self.shared_storage.copy_from_shared(relative_ref)
-            except Exception:
-                return ""
-            if not fresh_copy or not os.path.isfile(fresh_copy):
-                return ""
-            try:
-                with open(fresh_copy, "r", encoding="utf-8", errors="replace") as f:
-                    return f.read()
-            except OSError:
-                return ""
-
-        return real_path, poll
 
     def _run_bridge_action(self, action):
         # Broad except is deliberate: pyjnius/Android calls can raise all
@@ -843,12 +641,15 @@ class RootWidget(BoxLayout):
 
     # ---- Output polling -------------------------------------------------
     def _start_polling(self, reader, silence_timeout_s=16):
-        """Poll `reader` every 2s for fresh output. If nothing at all comes
-        back within `silence_timeout_s`, surface the most likely reason
-        instead of leaving the user staring at an unchanged screen:
-        Termux almost certainly hasn't accepted the command, which nearly
-        always means 'Setup Termux' was opened but the paste + Enter step
-        inside Termux itself was never actually completed.
+        """Poll `reader` every 2s for fresh output.
+
+        `reader` reads a plain path Termux wrote to directly (see
+        termux_bridge.read_log's docstring) -- this can come back empty on
+        Android 10+ scoped storage even once Termux has genuinely finished,
+        since our own process may simply be unable to see the file. If
+        nothing at all comes back within `silence_timeout_s`, surface the
+        most likely reason (Termux never accepted the command) while being
+        clear that checking Termux directly is always the reliable option.
         """
         if self._poll_event:
             self._poll_event.cancel()
@@ -870,10 +671,11 @@ class RootWidget(BoxLayout):
             if state["ticks"] >= max_ticks:
                 state["hinted"] = True
                 self._append_output(
-                    f"[Termux Error] No response from Termux after {silence_timeout_s}s. "
-                    "This almost always means the command wasn't accepted -- open Termux "
-                    "and confirm you pasted + pressed Enter for the 'Setup Termux' command "
-                    "(tapping the button alone only copies it), then try again.\n"
+                    f"[Termux Error] No output visible here after {silence_timeout_s}s. "
+                    "Either Termux hasn't accepted the command (confirm 'Setup Termux' was "
+                    "pasted + Enter inside Termux, not just tapped), or this device's storage "
+                    "permissions won't let this app read Termux's output file even though "
+                    "Termux is working fine -- open Termux directly to check either way.\n"
                 )
 
         self._poll_event = Clock.schedule_interval(poll, 2)
