@@ -254,12 +254,15 @@ def is_termux_installed():
 
 
 def read_log(log_path):
-    """Best-effort direct read of a plain path Termux wrote to. On
-    Android 10+ scoped storage this can fail silently (returns "") for
-    our own process even though the file exists and Termux can see it
-    fine -- there is no in-app workaround for that short of
-    MANAGE_EXTERNAL_STORAGE, so callers should treat empty as
-    "unknown/check Termux directly", not "nothing happened yet".
+    """Direct read of a plain path Termux wrote to.
+
+    The APK's manifest carries android:requestLegacyExternalStorage="true"
+    (patched in by p4a_hook.py at build time), which restores full plain
+    filesystem access on Android 10/11 regardless of targetSdkVersion. On
+    Android 12+ that flag is ignored, so this can still fail silently
+    (returns "") there without MANAGE_EXTERNAL_STORAGE -- callers should
+    treat empty as "unknown/check Termux directly", not "nothing happened
+    yet".
     """
     if not os.path.isfile(log_path):
         return ""

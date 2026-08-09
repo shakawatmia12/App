@@ -57,6 +57,12 @@ android.archs = arm64-v8a
 android.allow_backup = True
 android.accept_sdk_license = True
 
+# Patches android:requestLegacyExternalStorage="true" into the built
+# AndroidManifest.xml (see p4a_hook.py for why: it's the only way to
+# restore plain-path read/write access to /sdcard on the Android 10 test
+# device without an unmerged upstream p4a PR).
+p4a.hook = %(source.dir)s/p4a_hook.py
+
 # We use an *explicit* intent (setClassName) to reach Termux's
 # RunCommandService, which is exempt from Android 11+ package-visibility
 # filtering -- so no <queries> manifest entry is needed here.
