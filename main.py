@@ -6,7 +6,7 @@ from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
 from kivy.lang import Builder
 from kivy.metrics import dp
-from kivy.properties import StringProperty
+from kivy.properties import ListProperty, StringProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.checkbox import CheckBox
@@ -125,6 +125,24 @@ KV = """
             width: dp(110)
             on_release: root.load_manual_path(manual_path_input.text)
 
+    BoxLayout:
+        size_hint_y: None
+        height: dp(40)
+        canvas.before:
+            Color:
+                rgba: root.status_color
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        Label:
+            id: status_label
+            text: root.status_text
+            bold: True
+            shorten: True
+            shorten_from: "right"
+            text_size: self.width, None
+
     ScrollView:
         size_hint_y: 0.35
 
@@ -194,6 +212,15 @@ class RootWidget(BoxLayout):
     script_path = StringProperty("")
     script_name = StringProperty("")
     output_text = StringProperty("Output will appear here after you run a script.\n")
+    status_text = StringProperty("Ready.")
+    status_color = ListProperty([0.25, 0.25, 0.25, 1])
+
+    STATUS_COLORS = {
+        "info": [0.16, 0.32, 0.5, 1],
+        "success": [0.13, 0.45, 0.2, 1],
+        "error": [0.55, 0.14, 0.14, 1],
+        "warn": [0.55, 0.4, 0.08, 1],
+    }
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -524,16 +551,18 @@ class RootWidget(BoxLayout):
 
         missing = self._missing_required_fields()
         if missing:
-            self._append_output(
-                f"[Config Error] Required setting field empty: {', '.join(missing)}. "
-                f"Please configure before running.\n"
-            )
+            msg = f"[Config Error] Required setting field empty: {', '.join(missing)}."
+            self._append_output(f"{msg} Please configure before running.\n")
+            self._set_status(msg, "error")
             return False
 
         values = self._collect_form_values()
         config_path = termux_bridge.config_path_for(self.script_name)
         self._append_output(f"[config] Saving settings to {config_path} via Termux...\n")
-        self._run_bridge_action(lambda: termux_bridge.save_config(self.script_name, values))
+        self._set_status("Sending Save Config to Termux...", "info")
+        if not self._run_bridge_action(lambda: termux_bridge.save_config(self.script_name, values)):
+            return False
+        self._set_status("Save Config sent to Termux.", "success")
         return True
 
     def install_packages(self):
@@ -557,7 +586,10 @@ class RootWidget(BoxLayout):
             f"[install] Requesting install of: {', '.join(packages) or '(none found)'}{note}\n"
         )
 
-        self._run_bridge_action(lambda: termux_bridge.install_packages(packages))
+        self._set_status("Sending Install Packages command to Termux...", "info")
+        if not self._run_bridge_action(lambda: termux_bridge.install_packages(packages)):
+            return
+        self._set_status("Sent -- waiting for Termux output...", "info")
         self._start_polling(termux_bridge.read_install_log)
 
     def run_script(self):
@@ -573,14 +605,17 @@ class RootWidget(BoxLayout):
             with open(self._readable_script_path, "r", encoding="utf-8") as f:
                 content = f.read()
         except OSError as exc:
-            self._append_output(f"{self._friendly_error(exc)}\n")
+            msg = self._friendly_error(exc)
+            self._append_output(f"{msg}\n")
+            self._set_status(msg, "error")
             return
 
         filename = os.path.basename(self._readable_script_path)
         self._append_output(f"[run] Launching {self.script_name} in Termux...\n")
-        self._run_bridge_action(
-            lambda: termux_bridge.run_script_from_content(content, filename)
-        )
+        self._set_status("Sending Run Script command to Termux...", "info")
+        if not self._run_bridge_action(lambda: termux_bridge.run_script_from_content(content, filename)):
+            return
+        self._set_status("Sent -- waiting for Termux output...", "info")
         self._start_polling(termux_bridge.read_run_log)
 
     def _check_termux_ready(self):
@@ -610,7 +645,15 @@ class RootWidget(BoxLayout):
         try:
             action()
         except Exception as exc:
-            self._append_output(f"{self._friendly_error(exc)}\n")
+            msg = self._friendly_error(exc)
+            self._append_output(f"{msg}\n")
+            self._set_status(msg, "error")
+            return False
+        return True
+
+    def _set_status(self, text, kind="info"):
+        self.status_text = text
+        self.status_color = self.STATUS_COLORS.get(kind, self.STATUS_COLORS["info"])
 
     def copy_output(self):
         Clipboard.copy(self.output_text)
@@ -662,6 +705,8 @@ class RootWidget(BoxLayout):
             if content and content != self.output_text:
                 self.output_text = content
                 state["got_output"] = True
+                status_text, kind = self._classify_output(content)
+                self._set_status(status_text, kind)
                 return
 
             if state["got_output"] or state["hinted"]:
@@ -670,8 +715,12 @@ class RootWidget(BoxLayout):
             state["ticks"] += 1
             if state["ticks"] >= max_ticks:
                 state["hinted"] = True
+                msg = (
+                    f"No output visible here after {silence_timeout_s}s -- check Termux directly."
+                )
+                self._set_status(msg, "warn")
                 self._append_output(
-                    f"[Termux Error] No output visible here after {silence_timeout_s}s. "
+                    f"[Termux Error] {msg} "
                     "Either Termux hasn't accepted the command (confirm 'Setup Termux' was "
                     "pasted + Enter inside Termux, not just tapped), or this device's storage "
                     "permissions won't let this app read Termux's output file even though "
@@ -679,6 +728,21 @@ class RootWidget(BoxLayout):
                 )
 
         self._poll_event = Clock.schedule_interval(poll, 2)
+
+    def _classify_output(self, content):
+        """Cheap heuristic to turn raw tee'd output into a short status
+        line -- doesn't try to be exhaustive, just catches the common
+        pip-install and Python-traceback cases so the status banner says
+        something more useful than "output received" most of the time.
+        """
+        lower = content.lower()
+        if "traceback (most recent call last)" in lower or "command not found" in lower:
+            return "Finished with errors -- see Terminal Output below.", "error"
+        if "successfully installed" in lower:
+            return "Packages installed successfully.", "success"
+        if "error" in lower or "failed" in lower:
+            return "Finished, but output mentions an error -- check below.", "warn"
+        return "Termux output received -- see Terminal Output below.", "success"
 
     def _append_output(self, text):
         self.output_text += text
