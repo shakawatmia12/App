@@ -647,7 +647,17 @@ class RootWidget(BoxLayout):
             # Feed the form's answers to the script's own input() calls, in
             # the same source order schema_engine.detect_inputs found them.
             values = self._collect_form_values()
-            stdin_values = [str(values.get(f["key"], "")) for f in schema_engine.get_fields(self.schema)]
+            stdin_values = []
+            for f in schema_engine.get_fields(self.schema):
+                val = values.get(f["key"], "")
+                # Auto-detected dropdowns display "N) description" but the
+                # script itself only ever typed a bare number/letter into
+                # its input() -- translate back to that raw value here.
+                option_values = f.get("_option_values")
+                options = f.get("options")
+                if option_values and options and val in options:
+                    val = option_values[options.index(val)]
+                stdin_values.append(str(val))
             self._append_output(
                 f"[run] Feeding {len(stdin_values)} answer(s) to the script's input() calls...\n"
             )

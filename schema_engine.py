@@ -218,6 +218,49 @@ def _extract_prompt_text(call_node):
     return ""
 
 
+_MENU_LINE_RE = re.compile(r'^\s*(\d+)\s*[.)\-:]\s*(.+?)\s*$')
+_SIMPLE_PRINT_RE = re.compile(r'^print\(\s*f?[\'"](.*)[\'"]\s*\)\s*$')
+
+
+def _collect_menu_options(source_lines, input_lineno, max_lookback=20):
+    """Look for a plain `print("N. option")`-per-line menu immediately
+    above an input() call, and return (display_options, raw_values) if
+    one is recognized, else (None, None).
+
+    Deliberately simple regex matching on raw source text rather than
+    full parsing: this only catches menus written as an unbroken run of
+    literal one-string-per-line print() calls right before the input()
+    that reads the choice (very common in hand-written CLI menus), and
+    safely finds nothing for anything more dynamic (a for-loop building
+    the menu, f-strings pulling from a list, etc.) rather than guessing.
+    """
+    menu_texts = []
+    idx = input_lineno - 2  # 0-indexed line immediately above the input() line
+    checked = 0
+    while idx >= 0 and checked < max_lookback:
+        line = source_lines[idx].strip()
+        if not line:
+            break
+        match = _SIMPLE_PRINT_RE.match(line)
+        if not match:
+            break
+        menu_texts.insert(0, match.group(1))
+        idx -= 1
+        checked += 1
+
+    options, raw_values = [], []
+    for text in menu_texts:
+        m = _MENU_LINE_RE.match(text)
+        if not m:
+            return None, None
+        raw_values.append(m.group(1))
+        options.append(f"{m.group(1)}) {m.group(2)}")
+
+    if len(options) >= 2:
+        return options, raw_values
+    return None, None
+
+
 def detect_inputs(script_path):
     """Best-effort scan for input() calls, in source order, used to build
     a settings form automatically when a script has no SCHEMA of its own.
@@ -237,6 +280,8 @@ def detect_inputs(script_path):
     except (OSError, UnicodeDecodeError, SyntaxError):
         return []
 
+    source_lines = source.splitlines()
+
     calls = [
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call)
@@ -248,13 +293,27 @@ def detect_inputs(script_path):
     fields = []
     for i, call in enumerate(calls, start=1):
         prompt = _extract_prompt_text(call)
-        fields.append({
+        field = {
             "key": f"input_{i}",
             "type": "text",
             "label": prompt or f"Input #{i}",
             "default": "",
             "required": False,
-        })
+        }
+
+        options, raw_values = _collect_menu_options(source_lines, call.lineno)
+        if options:
+            # A numbered print() menu was found right above this input() --
+            # render it as a dropdown instead of a plain text box. The
+            # displayed option is "N) description" for readability, but
+            # the value actually fed to the script's stdin (see
+            # main.py.run_script) is just the raw "N" the script expects.
+            field["type"] = "select"
+            field["options"] = options
+            field["default"] = options[0]
+            field["_option_values"] = raw_values
+
+        fields.append(field)
     return fields
 
 
