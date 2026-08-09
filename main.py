@@ -640,97 +640,22 @@ class RootWidget(BoxLayout):
             self._attachment_labels[field["key"]] = name_label
             return row
 
-        # text/number/select all share one row: the actual input widget
-        # plus a small toggle button. Auto-detection is a best-effort
-        # static scan (see schema_engine.auto_detect_fields) -- it can
-        # miss an unfamiliar menu style, or occasionally guess "select"
-        # for something that isn't really a menu. Rather than that being
-        # a dead end, the toggle lets the user fix it by hand on the
-        # spot, for any field, without editing any code.
-        row = BoxLayout(size_hint_y=None, height=44, spacing=dp(4))
-        self._fill_field_row(row, field, value)
-        return row
+        if ftype == "select":
+            options = field.get("options", [])
+            return Spinner(
+                text=str(value) if value else (options[0] if options else ""),
+                values=options,
+                size_hint_y=None,
+                height=44,
+            )
 
-    def _make_text_input(self, field, value):
         return TextInput(
             text=str(value),
             multiline=False,
-            input_filter="float" if field["type"] == "number" else None,
+            input_filter="float" if ftype == "number" else None,
             size_hint_y=None,
             height=44,
         )
-
-    def _make_spinner(self, field, value):
-        options = field.get("options", [])
-        return Spinner(
-            text=str(value) if value else (options[0] if options else ""),
-            values=options,
-            size_hint_y=None,
-            height=44,
-        )
-
-    def _fill_field_row(self, row, field, value):
-        """(Re)populate `row` with the widget matching field["type"] plus
-        a toggle button, and point self.field_widgets at the actual input
-        widget (not the row) so the rest of the form code -- collecting
-        values, checking required fields -- never needs to know a toggle
-        exists."""
-        row.clear_widgets()
-        inner = self._make_spinner(field, value) if field["type"] == "select" \
-            else self._make_text_input(field, value)
-        row.add_widget(inner)
-        self.field_widgets[field["key"]] = (field, inner)
-
-        toggle_btn = Button(text="[b]<->[/b]", markup=True, size_hint_x=None, width=dp(36))
-        toggle_btn.bind(on_release=lambda *_a, k=field["key"], r=row: self._toggle_field_widget(k, r))
-        row.add_widget(toggle_btn)
-
-    def _toggle_field_widget(self, key, row):
-        field, widget = self.field_widgets[key]
-        current_value = widget.text
-        if field["type"] == "select":
-            field["type"] = "number" if field.get("_was_number") else "text"
-            field.pop("options", None)
-            field.pop("_option_values", None)
-            field["default"] = current_value
-            self._fill_field_row(row, field, current_value)
-        else:
-            self._prompt_manual_options(field, row, current_value)
-
-    def _prompt_manual_options(self, field, row, current_value):
-        content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(10))
-        content.add_widget(Label(
-            text="Enter dropdown options, comma-separated:",
-            size_hint_y=None, height=dp(30), halign="left",
-        ))
-        options_input = TextInput(text=current_value or "", multiline=False,
-                                   size_hint_y=None, height=dp(44))
-        content.add_widget(options_input)
-        btn_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
-        cancel_btn = Button(text="Cancel")
-        ok_btn = Button(text="Make Dropdown")
-        btn_row.add_widget(cancel_btn)
-        btn_row.add_widget(ok_btn)
-        content.add_widget(btn_row)
-        popup = Popup(title=f"Options: {field['label']}", content=content,
-                       size_hint=(0.9, None), height=dp(190))
-
-        def _apply(*_a):
-            options = [o.strip() for o in options_input.text.split(",") if o.strip()]
-            if len(options) < 2:
-                self._show_message("Enter at least 2 comma-separated options.")
-                return
-            field["_was_number"] = field["type"] == "number"
-            field["type"] = "select"
-            field["options"] = options
-            field.pop("_option_values", None)
-            field["default"] = options[0]
-            popup.dismiss()
-            self._fill_field_row(row, field, options[0])
-
-        ok_btn.bind(on_release=_apply)
-        cancel_btn.bind(on_release=lambda *_a: popup.dismiss())
-        popup.open()
 
     def _collect_form_values(self):
         values = {}

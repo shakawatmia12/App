@@ -348,58 +348,77 @@ def _collect_print_menu(block, call_stmt_idx):
     return None, None
 
 
-# Same numbering shapes as _MENU_LINE_RE, but not anchored to the whole
-# line -- used to pull "[1] label" / "1. label" fragments out of a raw
-# source line regardless of what Python statement it's actually part of
-# (string concatenation, an unusual print() shape, etc.). Stops at the
-# first quote/backslash so it doesn't swallow the rest of the line.
-_RAW_MENU_ITEM_RE = re.compile(
-    r'[\[\(]?\s*(\d{1,2})\s*[\]\)]?\s*[.\-:]?\s*([A-Za-z0-9][A-Za-z0-9 ._@/:-]{0,40}?)(?=["\'\\]|$)'
-)
 _RAW_INPUT_CALL_RE = re.compile(r'\binput\s*\(')
+_RAW_NUMBER_TOKEN_RE = re.compile(r'(?<!\d)(\d{1,2})(?!\d)')
 
 
-def _raw_regex_menu_scan(source_lines, input_lineno, lookback=6):
-    """Last-resort permissive fallback for menus the structural AST scan
-    can't cleanly resolve (a print() built from concatenation, an
-    f-string the strict extractor rejected, unusual formatting) -- scans
-    the raw text of up to `lookback` lines immediately above the input()
-    call (ANSI already stripped up front by _read_source_clean) for
-    "[1] label" / "1. label" / "1) label" fragments wherever they sit on
-    the line. Looser than the AST scan on purpose, and only consulted
-    when that scan found nothing -- a safety net, not the primary path.
+def _raw_line_menu_item(line):
+    """Very permissive, shape-agnostic extraction: does this single
+    source line contain something that looks like ONE numbered/bracketed
+    menu option, no matter how it's actually built -- a plain print()
+    literal, colour applied via string concatenation or an f-string with
+    a variable/Fore.GREEN-style placeholder, "[1]", "1.", "1)", or a
+    prefixed style like "[G][1]"? Returns (number, label) or (None,
+    None).
 
-    Stops the instant it hits a line calling input() itself -- without
-    that boundary this would happily walk straight past a DIFFERENT,
+    Only the number has to be right, since that's the raw value actually
+    fed back to the script's stdin (see run_script in main.py) -- a
+    messy label left over from stripped call/quote syntax around it is
+    cosmetic, not functional, so this deliberately does not try to be a
+    real parser.
+    """
+    text = line.strip()
+    text = re.sub(r'^print\s*\(', ' ', text)
+    text = re.sub(r'\)\s*$', ' ', text)
+    text = re.sub(r'''f?["']''', ' ', text)
+
+    match = _RAW_NUMBER_TOKEN_RE.search(text)
+    if not match:
+        return None, None
+
+    num = match.group(1)
+    label = text[:match.start()] + text[match.end():]
+    label = re.sub(r'[\[\]()+,]+', ' ', label)
+    label = re.sub(r'\s+', ' ', label).strip(' .:-')
+    if not label:
+        return None, None
+    return num, label
+
+
+def _raw_regex_menu_scan(source_lines, input_lineno, lookback=25):
+    """Last-resort, structure-agnostic fallback for menus the structural
+    AST scan can't cleanly resolve -- colour applied via a variable or
+    Fore.GREEN-style call the strict AST extractor won't guess the value
+    of, a print() built from concatenation, an unusual call shape, etc.
+    Scans up to `lookback` raw lines immediately above the input() call
+    (ANSI escapes already stripped up front by _read_source_clean) for
+    anything that looks like a numbered option, tolerating blank lines,
+    headers, comments, and non-print statements freely mixed in between
+    -- only consulted when the AST scan found nothing, as a safety net,
+    not the primary path.
+
+    Stops the instant it reaches a different input() call -- without
+    that boundary this would walk straight past a separate,
     already-answered prompt's menu and misattribute it to the current
     one, since raw text has no notion of "which statement is this line
     part of" the way the AST scan does.
     """
     start = max(0, input_lineno - 1 - lookback)
-    options, raw_values, seen = [], [], set()
+    collected = []
+    seen = set()
     for idx in range(input_lineno - 2, start - 1, -1):
         raw_line = source_lines[idx]
         if _RAW_INPUT_CALL_RE.search(raw_line):
             break
-        # Matches within one line come out of finditer left-to-right
-        # already; only the *line* order needs reversing (we're walking
-        # upward from the input() call), so stack each line's matches
-        # onto the front as a whole rather than one at a time -- doing
-        # it one at a time would also flip the order of options that
-        # share a single line, e.g. print("1. Fast\n2. Stealth").
-        line_matches = []
-        for m in _RAW_MENU_ITEM_RE.finditer(raw_line):
-            num, label = m.group(1), m.group(2).strip()
-            if not label or num in seen:
-                continue
+        num, label = _raw_line_menu_item(raw_line)
+        if num and label and num not in seen:
             seen.add(num)
-            line_matches.append((num, label))
-        for num, label in reversed(line_matches):
-            raw_values.insert(0, num)
-            options.insert(0, f"{num}) {label}")
-    if len(options) >= 2:
-        return options, raw_values
-    return None, None
+            collected.insert(0, (num, label))
+    if len(collected) < 2:
+        return None, None
+    raw_values = [n for n, _ in collected]
+    options = [f"{n}) {l}" for n, l in collected]
+    return options, raw_values
 
 
 def _resolve_literal_lists(tree):
