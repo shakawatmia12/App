@@ -1,15 +1,16 @@
-"""Dynamic schema parser and JSON config persistence engine.
+"""Dynamic schema parser, dependency detector, and JSON config utilities.
 
 Reads a top-level `SCHEMA` dict from a target .py file using `ast`
 (never `exec`/`eval` of the whole file), extracts the pip package list
-and dynamic UI field definitions, and persists per-script user settings
-to a single JSON file (default: /sdcard/config.json).
+and dynamic UI field definitions, detects third-party imports the script
+actually uses, and provides small platform-agnostic helpers for the
+per-script JSON config files main.py manages on Android.
 """
 import ast
 import json
 import os
-
-CONFIG_PATH = "/sdcard/config.json"
+import re
+import sys
 
 SUPPORTED_FIELD_TYPES = {"number", "text", "boolean", "select"}
 
@@ -109,6 +110,7 @@ def _normalize_field(raw_field):
         "type": ftype,
         "label": raw_field.get("label", str(key)),
         "default": raw_field.get("default", _type_default(ftype)),
+        "required": bool(raw_field.get("required", False)),
     }
 
     if ftype == "select":
@@ -132,40 +134,6 @@ def get_fields(schema):
     return list(schema.get("fields", []))
 
 
-def load_all_config(config_path=CONFIG_PATH):
-    if not os.path.isfile(config_path):
-        return {}
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def load_config_for_script(script_path, config_path=CONFIG_PATH):
-    """Return the previously saved settings dict for one specific script."""
-    return load_all_config(config_path).get(script_path, {})
-
-
-def save_config_for_script(script_path, values, config_path=CONFIG_PATH):
-    """Persist `values` under `script_path` inside the shared config JSON.
-
-    The file keeps one entry per script path so multiple wrapped scripts
-    can share the same config.json without clobbering each other.
-    """
-    all_config = load_all_config(config_path)
-    all_config[script_path] = values
-
-    parent = os.path.dirname(config_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(all_config, f, indent=2, ensure_ascii=False)
-
-    return config_path
-
-
 def cast_field_value(field, raw_value):
     """Coerce a raw widget value to the type declared by its field schema."""
     ftype = field["type"]
@@ -181,3 +149,78 @@ def cast_field_value(field, raw_value):
         return bool(raw_value)
 
     return str(raw_value)
+
+
+# ---- Dependency auto-detection ---------------------------------------
+
+def _stdlib_module_names():
+    try:
+        return set(sys.stdlib_module_names)  # Python 3.10+
+    except AttributeError:
+        return set(sys.builtin_module_names) | {
+            "os", "sys", "time", "json", "re", "math", "random", "subprocess",
+            "threading", "collections", "itertools", "functools", "typing",
+            "pathlib", "shutil", "logging", "argparse", "datetime", "string",
+            "io", "socket", "http", "urllib", "sqlite3", "csv", "hashlib",
+            "base64", "struct", "copy", "enum", "abc", "asyncio", "queue",
+            "traceback", "unittest", "xml", "email", "glob", "tempfile",
+            "zipfile", "gzip", "pickle", "ast", "shlex", "platform", "uuid",
+            "warnings", "contextlib", "dataclasses", "statistics", "operator",
+            "textwrap", "configparser", "secrets", "signal", "select", "ctypes",
+        }
+
+
+def detect_imports(script_path):
+    """Best-effort scan of a script's top-level `import x` / `from x import
+    y` statements via ast, returning third-party module names (stdlib
+    filtered out). Used to auto-suggest packages for "Install Packages"
+    without requiring every script to hand-list them in SCHEMA.
+    """
+    try:
+        with open(script_path, "r", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=script_path)
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return []
+
+    modules = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                modules.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module:
+                modules.add(node.module.split(".")[0])
+
+    stdlib = _stdlib_module_names()
+    return sorted(m for m in modules if m and m not in stdlib)
+
+
+# ---- Per-script config helpers (platform-agnostic) ---------------------
+
+def sanitize_name(name):
+    """Turn a script filename into a safe token for a config filename."""
+    stem = os.path.splitext(name or "script")[0]
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_")
+    return cleaned or "script"
+
+
+def config_filename_for(script_name):
+    return f"{sanitize_name(script_name)}_config.json"
+
+
+def load_json_file(path):
+    """Read a JSON dict from `path`, returning {} for anything that isn't
+    a valid, present JSON object (missing file, empty file, bad JSON)."""
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        return json.loads(content) if content else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def dump_json(values):
+    return json.dumps(values, indent=2, ensure_ascii=False)

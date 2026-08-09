@@ -19,7 +19,6 @@ Design notes
   notes at the end of buildozer.spec / project README for the full checklist.
 """
 import base64
-import hashlib
 import json
 import os
 import shlex
@@ -87,33 +86,22 @@ def build_run_command(script_path, extra_args=None, log_path=None):
     return f"{mkdir} && ({body}) 2>&1 | tee {shlex.quote(target)}"
 
 
-def _config_filename_for(script_path):
-    digest = hashlib.md5(script_path.encode("utf-8")).hexdigest()[:12]
-    return f"config_{digest}.json"
-
-
-def config_path_for(script_path):
-    """Per-script config file path (avoids read-modify-write of one shared
-    JSON file, which would need something in Termux capable of parsing
-    JSON just to merge keys -- plain `base64 -d > file` needs nothing but
-    coreutils, which Termux always has even before `pkg install python`)."""
-    return f"{LOG_DIR}/{_config_filename_for(script_path)}"
-
-
-def build_save_config_command(script_path, values):
-    """Have Termux itself write the config file.
+def build_save_config_command(config_path, values):
+    """Have Termux itself write the config file at `config_path`.
 
     Our own app's process is scoped-storage-restricted on Android 10+ and
     can't reliably write arbitrary shared-storage paths, but Termux
     already has full storage access via `termux-setup-storage`. Values
     are base64-encoded so arbitrary JSON (quotes, newlines) survives
-    shell-command quoting unscathed.
+    shell-command quoting unscathed. `config_path` is resolved by the
+    caller (see main.py's _ensure_config_registered / _config_real_path),
+    since only it knows the SAF-published real path our own process can
+    later read back with copy_from_shared().
     """
-    config_path = config_path_for(script_path)
     payload = json.dumps(values, indent=2, ensure_ascii=False)
     encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
 
-    mkdir = f"mkdir -p {shlex.quote(LOG_DIR)}"
+    mkdir = f"mkdir -p {shlex.quote(os.path.dirname(config_path))}"
     write = f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(config_path)}"
     return f"{mkdir} && {write} && echo 'Config saved to {config_path}'"
 
@@ -142,7 +130,6 @@ def send_termux_command(shell_command, session_action="0", background=False):
 
     PythonActivity = autoclass("org.kivy.android.PythonActivity")
     Intent = autoclass("android.content.Intent")
-    ContextCompat = autoclass("androidx.core.content.ContextCompat")
 
     activity = PythonActivity.mActivity
 
@@ -162,7 +149,17 @@ def send_termux_command(shell_command, session_action="0", background=False):
             _to_java_string_array(["-c", shell_command]),
         )
 
-    ContextCompat.startForegroundService(activity, intent)
+    # Plain framework Activity methods instead of androidx.core's
+    # ContextCompat.startForegroundService(): buildozer/p4a's default
+    # Gradle setup doesn't bundle androidx.core, so that class straight up
+    # doesn't exist in the compiled APK (ClassNotFoundException at
+    # runtime, confirmed on device). startForegroundService() has existed
+    # on the plain Activity/Context class since API 26, no AndroidX needed.
+    VERSION = autoclass("android.os.Build$VERSION")
+    if VERSION.SDK_INT >= 26:
+        activity.startForegroundService(intent)
+    else:
+        activity.startService(intent)
 
 
 def install_packages(packages, log_path=None):
@@ -179,9 +176,9 @@ def run_script(script_path, extra_args=None, log_path=None):
     return command
 
 
-def save_config(script_path, values):
+def save_config(config_path, values):
     """Save Config Action: delegate the actual file write to Termux."""
-    command = build_save_config_command(script_path, values)
+    command = build_save_config_command(config_path, values)
     send_termux_command(command, background=True)
     return command
 

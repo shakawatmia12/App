@@ -5,8 +5,10 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
 from kivy.lang import Builder
+from kivy.metrics import dp
 from kivy.properties import StringProperty
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
 from kivy.uix.checkbox import CheckBox
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
@@ -39,7 +41,8 @@ except ImportError:
 #    the file into a public MediaStore collection, which lands as a real
 #    file on disk that Termux (full, unrestricted storage access) can run
 #    directly -- Termux was never the problem, our own process reading
-#    arbitrary paths was.
+#    arbitrary paths was. The same trick is reused for live log output
+#    and per-script saved config below.
 try:
     from androidstorage4kivy import Chooser, SharedStorage
 except ImportError:
@@ -90,11 +93,12 @@ KV = """
             width: dp(200)
             on_release: root.pick_script()
 
-        Label:
+        Button:
             id: script_label
-            text: root.script_name or "No script selected"
+            text: (root.script_name or "No script selected") + (" (tap for options)" if root.script_name else "")
             shorten: True
             shorten_from: "left"
+            on_release: root.show_script_options()
 
     BoxLayout:
         size_hint_y: None
@@ -176,6 +180,12 @@ KV = """
             padding: dp(6), dp(6)
 """
 
+# Must match buildozer.spec's [app] `title` -- androidstorage4kivy nests
+# every shared path under this app-title segment and there's no API to
+# ask it for that value from outside a running app instance, so scripts
+# reading their own config back (see schema_template.py) hardcode it too.
+APP_TITLE = "Script Wrapper"
+
 
 class RootWidget(BoxLayout):
     script_path = StringProperty("")
@@ -187,6 +197,7 @@ class RootWidget(BoxLayout):
         self.schema = schema_engine.default_schema("")
         self.field_widgets = {}
         self._poll_event = None
+        self._readable_script_path = ""
 
         if ON_ANDROID and SharedStorage is not None and Chooser is not None:
             self.shared_storage = SharedStorage()
@@ -214,17 +225,19 @@ class RootWidget(BoxLayout):
         try:
             termux_bridge.open_termux()
         except Exception as exc:
-            self._append_output(f"[error] {exc}\n")
+            self._append_output(f"{self._friendly_error(exc)}\n")
 
     # ---- Storage access (Android 11+ scoped storage) ----------------------
     def request_storage_access(self):
         """Guide the user to the one-tap "All files access" toggle.
 
         On Android 11+, plain WRITE/READ_EXTERNAL_STORAGE no longer allows
-        opening arbitrary paths like /sdcard/config.json or a script the
-        user picked from anywhere in shared storage. That requires the
-        MANAGE_EXTERNAL_STORAGE special permission, which can only be
-        granted through a Settings screen -- no app can flip it for itself.
+        opening arbitrary paths like a script picked from anywhere in
+        shared storage. That requires the MANAGE_EXTERNAL_STORAGE special
+        permission, which can only be granted through a Settings screen --
+        no app can flip it for itself. Most flows no longer need this
+        (they go through androidstorage4kivy/SAF instead), but the manual
+        "Load Path" fallback still benefits from it on Android 11+.
         """
         if not ON_ANDROID:
             self._show_message("Storage access request only applies on Android.")
@@ -283,7 +296,7 @@ class RootWidget(BoxLayout):
             try:
                 filechooser.open_file(on_selection=self._on_file_selected, path="/sdcard")
             except Exception as exc:
-                self._append_output(f"[error] Could not open file picker: {exc}\n")
+                self._append_output(f"{self._friendly_error(exc)}\n")
             return
         self._show_message("No file picker available -- use 'Load Path' below instead.")
 
@@ -296,16 +309,16 @@ class RootWidget(BoxLayout):
         """Read a SAF-picked file via androidstorage4kivy, then publish it
         to public shared storage so Termux can run it by real path.
 
-        See the module-level NOTE above pick_script's imports for why this
-        two-step copy is necessary instead of just using a resolved path.
+        See the module-level NOTE above the imports for why this two-step
+        copy is necessary instead of just using a resolved path.
         """
         try:
             private_path = self.shared_storage.copy_from_shared(shared_file)
         except Exception as exc:
-            self._append_output(f"[error] Could not read picked file: {exc}\n")
+            self._append_output(f"{self._friendly_error(exc)}\n")
             return
         if not private_path:
-            self._append_output("[error] Could not read the picked file (no data returned).\n")
+            self._append_output("[File Error] Could not read the picked file (no data returned).\n")
             return
 
         filename = os.path.basename(private_path)
@@ -316,7 +329,7 @@ class RootWidget(BoxLayout):
         try:
             schema = schema_engine.load_schema_from_file(private_path)
         except schema_engine.SchemaError as exc:
-            self._show_message(str(exc))
+            self._show_message(self._friendly_error(exc))
             return
 
         try:
@@ -341,7 +354,7 @@ class RootWidget(BoxLayout):
             )
             return
 
-        self._apply_loaded_script(schema, run_path, filename)
+        self._apply_loaded_script(schema, run_path, filename, readable_path=private_path)
         self._append_output(f"[schema] Termux will run: {run_path}\n")
 
     def _uri_to_real_path(self, uri):
@@ -424,29 +437,136 @@ class RootWidget(BoxLayout):
         try:
             schema = schema_engine.load_schema_from_file(path)
         except schema_engine.SchemaError as exc:
-            self._show_message(str(exc))
+            self._show_message(self._friendly_error(exc))
             return
 
         self._apply_loaded_script(schema, path, os.path.basename(path))
 
-    def _apply_loaded_script(self, schema, run_path, display_name):
+    def _apply_loaded_script(self, schema, run_path, display_name, readable_path=None):
         self.schema = schema
         self.script_path = run_path
         self.script_name = display_name
-        self._build_form()
+        self._readable_script_path = readable_path or run_path
+
+        saved_values = self._load_saved_config()
+        self._build_form(saved_values)
+
         self._append_output(f"[schema] Loaded '{self.schema.get('name')}' "
                              f"({len(schema_engine.get_fields(self.schema))} fields, "
                              f"{len(schema_engine.get_packages(self.schema))} packages)\n")
+        if saved_values:
+            self._append_output(f"[config] Restored previously saved settings for '{self.script_name}'.\n")
+
+    # ---- Per-script config: paths, load, reset -----------------------------
+    def _config_relative_ref(self):
+        filename = schema_engine.config_filename_for(self.script_name)
+        return f"Documents/{APP_TITLE}/configs/{filename}"
+
+    def _config_real_path(self):
+        return f"/storage/emulated/0/{self._config_relative_ref()}"
+
+    def _load_saved_config(self):
+        """Best-effort read of this script's previously saved settings.
+
+        Uses copy_from_shared() the same way _handle_picked_file does for
+        scripts -- a plain path read would hit the same scoped-storage
+        wall on Android 10+ that broke file picking originally.
+        """
+        if not self.script_name:
+            return {}
+        if self.shared_storage is None:
+            return schema_engine.load_json_file(self._config_real_path())
+        try:
+            private_copy = self.shared_storage.copy_from_shared(self._config_relative_ref())
+        except Exception:
+            return {}
+        return schema_engine.load_json_file(private_copy)
+
+    def _ensure_config_registered(self):
+        """Make sure this script's config file exists as a MediaStore entry
+        before Termux writes into it, so a later copy_from_shared() can
+        find it -- otherwise a file Termux creates via plain shell redirect
+        may never get indexed and reads for it will keep coming back empty.
+        Returns the real path Termux should write to.
+        """
+        real_path = self._config_real_path()
+        if self.shared_storage is None:
+            return real_path
+
+        try:
+            already_there = self.shared_storage.copy_from_shared(self._config_relative_ref())
+        except Exception:
+            already_there = None
+        if already_there:
+            return real_path
+
+        try:
+            from jnius import autoclass
+
+            Environment = autoclass("android.os.Environment")
+            cache_dir = self.shared_storage.get_cache_dir()
+            filename = schema_engine.config_filename_for(self.script_name)
+            placeholder = os.path.join(cache_dir, filename)
+            with open(placeholder, "w", encoding="utf-8") as f:
+                f.write("{}")
+            self.shared_storage.copy_to_shared(
+                placeholder,
+                collection=Environment.DIRECTORY_DOCUMENTS,
+                filepath=f"configs/{filename}",
+            )
+        except Exception as exc:
+            self._append_output(f"[warn] Could not prepare config storage ({exc}).\n")
+
+        return real_path
+
+    def show_script_options(self):
+        if not self.script_path:
+            return
+
+        content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        content.add_widget(Label(text=self.script_name))
+
+        button_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        reset_btn = Button(text="Reset/Delete Saved Settings")
+        cancel_btn = Button(text="Cancel")
+        button_row.add_widget(reset_btn)
+        button_row.add_widget(cancel_btn)
+        content.add_widget(button_row)
+
+        popup = Popup(title="Script Options", content=content, size_hint=(0.85, 0.35))
+
+        def do_reset(_instance):
+            popup.dismiss()
+            self.reset_config()
+
+        reset_btn.bind(on_release=do_reset)
+        cancel_btn.bind(on_release=lambda *_a: popup.dismiss())
+        popup.open()
+
+    def reset_config(self):
+        if not self.script_path:
+            self._show_message("Select a script first.")
+            return
+
+        if self.shared_storage is not None:
+            try:
+                self.shared_storage.delete_shared(self._config_relative_ref())
+            except Exception as exc:
+                self._append_output(f"[warn] Could not delete saved config: {exc}\n")
+        else:
+            real_path = self._config_real_path()
+            try:
+                if os.path.isfile(real_path):
+                    os.remove(real_path)
+            except OSError as exc:
+                self._append_output(f"[warn] Could not delete saved config: {exc}\n")
+
+        self._build_form({})
+        self._append_output(f"[config] Reset saved settings for '{self.script_name}'.\n")
 
     # ---- Dynamic form -------------------------------------------------
-    def _build_form(self):
-        # NOTE: fields always start from the schema's declared defaults,
-        # not a previously-saved config -- Termux owns the per-script
-        # config file now (see save_config()/termux_bridge.save_config),
-        # and our own scoped-storage-restricted process can't reliably
-        # read it back to pre-fill the form. Save Config still writes the
-        # values Termux actually runs with; only this pre-fill convenience
-        # is what's traded away.
+    def _build_form(self, saved_values=None):
+        saved_values = saved_values or {}
         grid = self.ids.form_grid
         grid.clear_widgets()
         self.field_widgets = {}
@@ -459,8 +579,10 @@ class RootWidget(BoxLayout):
             return
 
         for field in fields:
-            grid.add_widget(Label(text=field["label"], size_hint_y=None, height=44))
-            widget = self._make_field_widget(field, field["default"])
+            label_text = field["label"] + (" *" if field.get("required") else "")
+            grid.add_widget(Label(text=label_text, size_hint_y=None, height=44))
+            value = saved_values.get(field["key"], field["default"])
+            widget = self._make_field_widget(field, value)
             self.field_widgets[field["key"]] = (field, widget)
             grid.add_widget(widget)
 
@@ -497,21 +619,56 @@ class RootWidget(BoxLayout):
             values[key] = schema_engine.cast_field_value(field, raw)
         return values
 
+    def _missing_required_fields(self):
+        missing = []
+        for _key, (field, widget) in self.field_widgets.items():
+            if not field.get("required"):
+                continue
+            if field["type"] == "boolean":
+                continue  # a checkbox has no "empty" state
+            if not str(widget.text).strip():
+                missing.append(field["label"])
+        return missing
+
     # ---- Actions -------------------------------------------------
     def save_config(self):
         if not self.script_path:
             self._show_message("Select a script first.")
-            return
+            return False
+
+        missing = self._missing_required_fields()
+        if missing:
+            self._append_output(
+                f"[Config Error] Required setting field empty: {', '.join(missing)}. "
+                f"Please configure before running.\n"
+            )
+            return False
+
         values = self._collect_form_values()
-        config_path = termux_bridge.config_path_for(self.script_path)
+        config_path = self._ensure_config_registered()
         self._append_output(f"[config] Saving settings to {config_path} via Termux...\n")
-        self._run_bridge_action(lambda: termux_bridge.save_config(self.script_path, values))
+        self._run_bridge_action(lambda: termux_bridge.save_config(config_path, values))
+        return True
 
     def install_packages(self):
-        packages = schema_engine.get_packages(self.schema)
+        if not self.script_path:
+            self._show_message("Select a script first.")
+            return
+
+        declared = schema_engine.get_packages(self.schema)
+        detected = []
+        if self._readable_script_path:
+            detected = schema_engine.detect_imports(self._readable_script_path)
+        packages = sorted(set(declared) | set(detected))
+
+        note = ""
+        new_from_detection = sorted(set(detected) - set(declared))
+        if new_from_detection:
+            note = f" (auto-detected from imports: {', '.join(new_from_detection)})"
         self._append_output(
-            f"[install] Requesting install of: {', '.join(packages) or '(none declared)'}\n"
+            f"[install] Requesting install of: {', '.join(packages) or '(none found)'}{note}\n"
         )
+
         log_path, poll = self._start_log_poll("install_output.log")
         self._run_bridge_action(lambda: termux_bridge.install_packages(packages, log_path=log_path))
         if poll:
@@ -521,7 +678,8 @@ class RootWidget(BoxLayout):
         if not self.script_path:
             self._show_message("Select a script first.")
             return
-        self.save_config()
+        if not self.save_config():
+            return
         self._append_output(f"[run] Launching {self.script_name} in Termux...\n")
         log_path, poll = self._start_log_poll("run_output.log")
         self._run_bridge_action(lambda: termux_bridge.run_script(self.script_path, log_path=log_path))
@@ -587,15 +745,38 @@ class RootWidget(BoxLayout):
         # reflection miss, etc.), not just RuntimeError. An earlier
         # version only caught RuntimeError here, so any other exception
         # type from a Termux call went uncaught and crashed the whole app
-        # instead of just showing an [error] line.
+        # instead of just showing an error line.
         try:
             action()
         except Exception as exc:
-            self._append_output(f"[error] {exc}\n")
+            self._append_output(f"{self._friendly_error(exc)}\n")
 
     def copy_output(self):
         Clipboard.copy(self.output_text)
         self._append_output("[info] Output copied to clipboard.\n")
+
+    # ---- Human-friendly diagnostics -----------------------------------
+    def _friendly_error(self, exc):
+        """Translate a raw exception into the short, actionable messages
+        asked for, instead of a backend traceback/repr the user can't act
+        on. Falls back to the raw message, prefixed, for anything unknown
+        -- so unexpected problems are still visible enough to report back.
+        """
+        text = str(exc)
+        lowered = text.lower()
+
+        if isinstance(exc, schema_engine.SchemaError) or isinstance(exc, (PermissionError, FileNotFoundError)) \
+                or "permission denied" in lowered or "errno 13" in lowered or "enoent" in lowered:
+            return "[File Error] Selected path does not exist or storage permission denied."
+
+        if "activitynotfoundexception" in lowered or "run_command" in lowered or "runcommandservice" in lowered:
+            return (
+                "[Termux Error] Termux didn't accept the command. Make sure "
+                "'Setup Termux' has been run (allow-external-apps) and Termux "
+                "itself has storage access (run 'termux-setup-storage' in Termux)."
+            )
+
+        return f"[Error] {text}"
 
     # ---- Output polling -------------------------------------------------
     def _start_polling(self, reader):
