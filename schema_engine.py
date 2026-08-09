@@ -295,6 +295,144 @@ def _collect_menu_options(source_lines, input_lineno, max_lookback=25):
     return None, None
 
 
+def _resolve_literal_lists(tree):
+    """Map every name assigned a literal list/tuple of scalars anywhere in
+    the module to its value, e.g. `domains = ["gmail.com", "yahoo.com"]`.
+    Used to resolve a for-loop like `for i, item in enumerate(domains):`
+    back to the actual option text even though the loop itself never
+    spells the options out."""
+    values = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, (ast.List, ast.Tuple)):
+            literal = _literal_value(node.value)
+            if isinstance(literal, (list, tuple)) and literal:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        values[target.id] = list(literal)
+    return values
+
+
+def _resolve_iterable(node, literal_lists):
+    """Resolve a for-loop's iterable to a concrete list of scalar values,
+    either from an inline literal (`for x in ["a", "b"]`) or a
+    previously-collected `name = [...]` assignment. None if it can't be
+    resolved statically (e.g. built from a function call or API result)."""
+    literal = _literal_value(node)
+    if isinstance(literal, (list, tuple)) and literal:
+        return list(literal)
+    if isinstance(node, ast.Name):
+        return literal_lists.get(node.id)
+    return None
+
+
+def _menu_from_for_loop(for_node, literal_lists):
+    """Recognize the two common ways scripts print a numbered/listed menu
+    from a list in a loop, rather than one print() literal per option:
+        for i, item in enumerate(DOMAINS): print(f"{i+1}. {item}")
+        for item in DOMAINS: print(item)
+    and return (options, raw_values) built from the list's actual
+    contents, or (None, None) if this loop doesn't look like a menu
+    printer (e.g. it never prints its loop variable at all)."""
+    target = for_node.target
+    iter_node = for_node.iter
+    item_names = []
+    items = None
+    numbered = False
+
+    if (isinstance(iter_node, ast.Call) and isinstance(iter_node.func, ast.Name)
+            and iter_node.func.id == "enumerate" and iter_node.args):
+        items = _resolve_iterable(iter_node.args[0], literal_lists)
+        numbered = True
+        if isinstance(target, ast.Tuple) and len(target.elts) == 2:
+            item_names = [elt.id for elt in target.elts if isinstance(elt, ast.Name)]
+    else:
+        items = _resolve_iterable(iter_node, literal_lists)
+        if isinstance(target, ast.Name):
+            item_names = [target.id]
+
+    if not items or len(items) < 2 or item_names is None or not item_names:
+        return None, None
+    if not all(isinstance(v, (str, int, float)) for v in items):
+        return None, None
+
+    prints_an_item = any(
+        isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "print"
+        and any(
+            isinstance(sub, ast.Name) and sub.id in item_names
+            for arg in call.args for sub in ast.walk(arg)
+        )
+        for stmt in for_node.body for call in ast.walk(stmt)
+    )
+    if not prints_an_item:
+        return None, None
+
+    if numbered:
+        options = [f"{i + 1}) {v}" for i, v in enumerate(items)]
+        raw_values = [str(i + 1) for i in range(len(items))]
+    else:
+        options = [str(v) for v in items]
+        raw_values = list(options)
+    return options, raw_values
+
+
+def _direct_child_blocks(stmt):
+    """One level of nested statement-lists belonging to `stmt` (its
+    body/orelse/finalbody, and each except-handler's body for a Try)."""
+    blocks = []
+    for field_name in ("body", "orelse", "finalbody"):
+        block = getattr(stmt, field_name, None)
+        if isinstance(block, list) and block and isinstance(block[0], ast.stmt):
+            blocks.append(block)
+    if isinstance(stmt, ast.Try):
+        for handler in stmt.handlers:
+            if handler.body:
+                blocks.append(handler.body)
+    return blocks
+
+
+def _contains_call(stmt, call):
+    return any(node is call for node in ast.walk(stmt))
+
+
+def _contains_input_call(stmt):
+    return any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "input"
+        for node in ast.walk(stmt)
+    )
+
+
+def _find_menu_for_call(block, call, literal_lists):
+    """Depth-first: find the innermost block of statements that directly
+    contains `call` (descending into if/for/while/try/function bodies so
+    a for-loop menu right next to the input(), not one merely earlier in
+    an enclosing function, wins), then look at the statement immediately
+    before it (skipping over plain print()/assignment "header" lines) for
+    a for-loop that builds a numbered/listed menu.
+
+    Stops looking the instant it hits another input()-bearing statement
+    while scanning backward -- that boundary means any for-loop beyond it
+    belongs to a *different*, already-answered prompt, not this one, so
+    two menus back-to-back in the same block each get matched to their
+    own input() rather than both grabbing whichever menu happens to be
+    scanned first.
+    """
+    for i, stmt in enumerate(block):
+        if not _contains_call(stmt, call):
+            continue
+        for nested in _direct_child_blocks(stmt):
+            if any(_contains_call(s, call) for s in nested):
+                options, raw_values = _find_menu_for_call(nested, call, literal_lists)
+                if options:
+                    return options, raw_values
+        for prev in reversed(block[:i]):
+            if isinstance(prev, ast.For):
+                return _menu_from_for_loop(prev, literal_lists)
+            if _contains_input_call(prev):
+                break
+        return None, None
+    return None, None
+
+
 def detect_inputs(script_path):
     """Best-effort scan for input() calls, in source order, used to build
     a settings form automatically when a script has no SCHEMA of its own.
@@ -315,6 +453,7 @@ def detect_inputs(script_path):
         return []
 
     source_lines = source.splitlines()
+    literal_lists = _resolve_literal_lists(tree)
 
     calls = [
         node for node in ast.walk(tree)
@@ -335,7 +474,16 @@ def detect_inputs(script_path):
             "required": False,
         }
 
-        options, raw_values = _collect_menu_options(source_lines, call.lineno)
+        # Two ways a menu can be built: a for-loop over a list (resolved
+        # via AST, handles the item text coming from a variable), or a
+        # literal print("N. option") per line right above the input()
+        # (regex-matched on source text). Try the AST-based one first --
+        # it's the more common style in real scripts and doesn't depend
+        # on the exact text ever being a source-code literal at the
+        # print() call site itself.
+        options, raw_values = _find_menu_for_call(tree.body, call, literal_lists)
+        if not options:
+            options, raw_values = _collect_menu_options(source_lines, call.lineno)
         if options:
             # A numbered print() menu was found right above this input() --
             # render it as a dropdown instead of a plain text box. The
