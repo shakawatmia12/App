@@ -29,8 +29,11 @@ android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,com.termux.pe
 android.api = 33
 android.minapi = 24
 android.ndk = 25b
-android.archs = arm64-v8a,armeabi-v7a
+# Single arch keeps the first CI build faster/less failure-prone.
+# Add ",armeabi-v7a" back once a build succeeds if you need 32-bit devices too.
+android.archs = arm64-v8a
 android.allow_backup = True
+android.accept_sdk_license = True
 
 # We use an *explicit* intent (setClassName) to reach Termux's
 # RunCommandService, which is exempt from Android 11+ package-visibility
