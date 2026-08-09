@@ -122,7 +122,18 @@ def _to_java_string_array(items):
     return cast("[Ljava.lang.String;", arr)
 
 
-def send_termux_command(shell_command, session_action="0", background=False):
+# Termux's four RUN_COMMAND_SESSION_ACTION values (from its own source):
+#   0 = keep current session, don't open Termux's activity
+#   1 = keep current session, open Termux's activity
+#   2 = switch to the new session, don't open Termux's activity
+#   3 = switch to the new session, open Termux's activity
+# We were defaulting to "0" -- Termux would run the command in a new
+# session but never bring itself to the foreground or switch to it, so
+# every successful run looked identical to nothing happening at all.
+SESSION_ACTION_SWITCH_AND_OPEN = "3"
+
+
+def send_termux_command(shell_command, session_action=SESSION_ACTION_SWITCH_AND_OPEN, background=False):
     """Fire the RUN_COMMAND intent at Termux. Android-only (needs pyjnius)."""
     try:
         from jnius import autoclass
