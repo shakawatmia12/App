@@ -146,7 +146,14 @@ def build_interactive_run_command(content, filename, extra_args=None, preset_ans
         encoded_preset = base64.b64encode(preset_payload.encode("utf-8")).decode("ascii")
         seed_answers = f"echo {shlex.quote(encoded_preset)} | base64 -d > {shlex.quote(answers)}"
     else:
-        seed_answers = f": > {shlex.quote(answers)}"
+        # Explicit zero-byte truncate -- no manual answer means the
+        # answers file (and therefore the FIFO) must stay completely
+        # empty until the user actually taps something. `printf '' >`
+        # writes literally nothing (not even a bare newline), unlike
+        # e.g. `echo "" >` which writes a single "\n" that Python's
+        # input() would read as an immediate blank answer the moment
+        # the script's first prompt is reached.
+        seed_answers = f"printf '' > {shlex.quote(answers)}"
 
     mkdir = f"mkdir -p {' '.join(shlex.quote(d) for d in mkdir_dirs)}"
     write_all = " && ".join(write_parts)

@@ -321,10 +321,17 @@ class RootWidget(BoxLayout):
                 "manage all files' on, then come back. One-time only.\n"
             )
         except Exception as exc:
+            # Some ROMs/Android versions don't ship an activity for the
+            # direct MANAGE_APP_ALL_FILES_ACCESS_PERMISSION shortcut
+            # (ActivityNotFoundException) -- this is an expected,
+            # harmless fallback path on those devices, not a crash, so
+            # the visible line stays calm; the raw exception still goes
+            # to [Debug] in case it's ever something else.
             self._append_output(
-                f"[warn] Direct toggle unavailable ({exc}).\n"
-                "[warn] Opening this app's settings page instead -- look for "
-                "'Files and media' / 'All files access' there.\n"
+                "[setup] That direct shortcut isn't available on this device -- "
+                "opening this app's settings page instead. Look for 'Files and "
+                "media' / 'All files access' there and enable it.\n"
+                f"[Debug] {type(exc).__name__}: {exc}\n"
             )
             self._open_app_settings()
 
@@ -635,6 +642,16 @@ class RootWidget(BoxLayout):
         self._shown_chunk_len = len(chunk)
         prompt = schema_engine.last_prompt_line(chunk)
         options, raw_values = schema_engine.parse_menu_options(chunk)
+        # Concrete evidence for next time instead of another guess: the
+        # exact (ANSI-stripped) text this button set was built from, and
+        # the exact raw values bound to each button -- if a script's own
+        # validation ever disagrees with what gets sent, this shows
+        # precisely what the app saw and decided, not just what it
+        # looked like on screen.
+        self._append_output(
+            f"[debug] Prompt chunk: {schema_engine.strip_ansi(chunk)!r}\n"
+            f"[debug] Detected options: {options!r} raw_values: {raw_values!r}\n"
+        )
 
         panel = self.ids.step_panel
         panel.clear_widgets()
@@ -701,7 +718,11 @@ class RootWidget(BoxLayout):
             self._show_message("Enter a value before sending.")
             return
         self._collected_answers.append(value)
-        self._append_output(f"[you] {value}\n")
+        # repr(), not the bare value -- reveals any invisible leading/
+        # trailing whitespace or stray newline that plain text would hide,
+        # so a report of "the script rejected my answer" carries actual
+        # evidence of exactly what was sent.
+        self._append_output(f"[you] {value!r}\n")
         self._run_bridge_action(lambda: termux_bridge.send_answer(self._current_filename, value))
         self._awaiting_input = False
         # Keep anything that arrived AFTER the snapshot the current step
