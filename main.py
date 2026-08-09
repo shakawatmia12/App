@@ -408,9 +408,22 @@ class RootWidget(BoxLayout):
         saved_values = self._load_saved_config()
         self._build_form(saved_values)
 
+        fields = schema_engine.get_fields(self.schema)
         self._append_output(f"[schema] Loaded '{self.schema.get('name')}' "
-                             f"({len(schema_engine.get_fields(self.schema))} fields, "
+                             f"({len(fields)} fields, "
                              f"{len(schema_engine.get_packages(self.schema))} packages)\n")
+        if not fields:
+            # 0 fields almost always means the script itself has no
+            # top-level `SCHEMA = {...}` dict with a "fields" list (see
+            # schema_template.py) -- not something this app can conjure up
+            # on its own. Say so explicitly instead of leaving the user to
+            # guess why "No configurable options" is showing.
+            self._append_output(
+                f"[schema] {self.schema.get('description', '')} "
+                "To add configurable settings, put a SCHEMA dict with a "
+                "'fields' list at the top of this .py file (see "
+                "schema_template.py for the format), then reselect it.\n"
+            )
         if saved_values:
             self._append_output(f"[config] Restored previously saved settings for '{self.script_name}'.\n")
 
@@ -611,7 +624,10 @@ class RootWidget(BoxLayout):
         if not self._run_bridge_action(lambda: termux_bridge.run_script_from_content(content, filename)):
             return
         self._set_status("Sent -- waiting for Termux output...", "info")
-        self._start_polling(termux_bridge.read_run_log)
+        # A longer grace period than Install Packages: user scripts can make
+        # slow network calls (translation APIs, requests, etc.) before
+        # printing anything at all, so 16s is too eager here.
+        self._start_polling(termux_bridge.read_run_log, silence_timeout_s=30)
 
     def _check_termux_ready(self):
         """Verify Termux is actually installed before firing a command at
@@ -725,16 +741,15 @@ class RootWidget(BoxLayout):
             state["ticks"] += 1
             if state["ticks"] >= max_ticks:
                 state["hinted"] = True
-                msg = (
-                    f"No output visible here after {silence_timeout_s}s -- check Termux directly."
-                )
+                msg = f"No output yet after {silence_timeout_s}s -- still checking automatically."
                 self._set_status(msg, "warn")
                 self._append_output(
-                    f"[Termux Error] {msg} "
-                    "Either Termux hasn't accepted the command (confirm 'Setup Termux' was "
-                    "pasted + Enter inside Termux, not just tapped), or this device's storage "
-                    "permissions won't let this app read Termux's output file even though "
-                    "Termux is working fine -- open Termux directly to check either way.\n"
+                    f"[Termux] {msg} This box updates itself the moment Termux writes "
+                    "anything, so if your script makes network calls (translation, "
+                    "requests, APIs) it may simply still be running -- no need to tap "
+                    "anything again. If this never changes after a couple of minutes, "
+                    "confirm 'Setup Termux' was pasted + Enter inside Termux (not just "
+                    "tapped), or open Termux directly to see what it's doing.\n"
                 )
 
         self._poll_event = Clock.schedule_interval(poll, 2)
