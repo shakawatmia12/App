@@ -31,6 +31,20 @@ LOG_DIR = "/sdcard/termux_wrapper"
 INSTALL_LOG = f"{LOG_DIR}/install_output.log"
 RUN_LOG = f"{LOG_DIR}/run_output.log"
 
+# Termux enforces `allow-external-apps=true` in its own private
+# ~/.termux/termux.properties before it will honor a RUN_COMMAND intent
+# from any other app. No app -- including this one -- can write into
+# Termux's private storage to flip that flag for the user (that's the
+# whole point of the setting: it's a deliberate, user-only opt-in gate).
+# The best we can do is make the one-time paste as short as possible.
+SETUP_COMMAND = (
+    "mkdir -p ~/.termux && "
+    "(grep -q allow-external-apps ~/.termux/termux.properties 2>/dev/null || "
+    "echo 'allow-external-apps=true' >> ~/.termux/termux.properties) && "
+    "termux-reload-settings && termux-setup-storage && "
+    "echo 'Termux is ready for Script Wrapper.'"
+)
+
 
 def _ensure_log_dir():
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -121,6 +135,25 @@ def run_script(script_path, extra_args=None):
     command = build_run_command(script_path, extra_args)
     send_termux_command(command)
     return command
+
+
+def open_termux():
+    """Bring Termux to the foreground (Android-only, needs pyjnius)."""
+    try:
+        from jnius import autoclass
+    except ImportError as exc:
+        raise RuntimeError(
+            "open_termux can only run inside the Android app."
+        ) from exc
+
+    PythonActivity = autoclass("org.kivy.android.PythonActivity")
+    activity = PythonActivity.mActivity
+
+    intent = activity.getPackageManager().getLaunchIntentForPackage(TERMUX_PACKAGE)
+    if intent is None:
+        raise RuntimeError("Termux does not appear to be installed.")
+
+    activity.startActivity(intent)
 
 
 def read_log(log_path):

@@ -36,6 +36,20 @@ KV = """
 
     BoxLayout:
         size_hint_y: None
+        height: dp(40)
+        spacing: dp(8)
+
+        Button:
+            text: "Setup Termux (one-time)"
+            on_release: root.setup_termux()
+
+        Label:
+            text: "Do this once before your first run"
+            font_size: "12sp"
+            color: 0.7, 0.7, 0.7, 1
+
+    BoxLayout:
+        size_hint_y: None
         height: dp(48)
         spacing: dp(8)
 
@@ -127,12 +141,37 @@ class RootWidget(BoxLayout):
         self.field_widgets = {}
         self._poll_event = None
 
+    # ---- One-time Termux setup -------------------------------------------
+    def setup_termux(self):
+        """Copy the setup command and bring Termux to the front.
+
+        Termux refuses RUN_COMMAND intents from other apps until
+        `allow-external-apps=true` is set inside its own private
+        ~/.termux/termux.properties. No app can write that file for the
+        user (that's Termux's whole point), so the best we can offer is:
+        copy the one-liner, open Termux, and let the user paste + Enter.
+        """
+        Clipboard.copy(termux_bridge.SETUP_COMMAND)
+        self._append_output(
+            "[setup] Command copied to clipboard.\n"
+            "[setup] Termux is opening -- long-press to Paste, then press Enter.\n"
+            "[setup] You only need to do this once.\n"
+        )
+        try:
+            termux_bridge.open_termux()
+        except RuntimeError as exc:
+            self._append_output(f"[error] {exc}\n")
+
     # ---- Script selection -------------------------------------------------
     def pick_script(self):
+        # Deliberately no `filters=` here: Android's native file picker
+        # (SAF) filters by MIME type, and ".py" has no reliable MIME
+        # mapping on most devices -- passing a filter made every .py file
+        # disappear from the picker. We show all files instead and
+        # validate the extension/content after the user picks one.
         if filechooser is not None:
             filechooser.open_file(
                 on_selection=self._on_file_selected,
-                filters=[("Python files", "*.py")],
                 path="/sdcard",
             )
         else:
@@ -145,6 +184,10 @@ class RootWidget(BoxLayout):
         Clock.schedule_once(lambda dt: self._load_script(selection[0]))
 
     def _load_script(self, path):
+        if not path.lower().endswith(".py"):
+            self._show_message(f"'{os.path.basename(path)}' is not a .py file. Pick a Python script.")
+            return
+
         try:
             self.schema = schema_engine.load_schema_from_file(path)
         except schema_engine.SchemaError as exc:

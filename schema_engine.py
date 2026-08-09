@@ -36,8 +36,11 @@ def load_schema_from_file(script_path):
     if not script_path or not os.path.isfile(script_path):
         raise SchemaError(f"Script not found: {script_path}")
 
-    with open(script_path, "r", encoding="utf-8") as f:
-        source = f.read()
+    try:
+        with open(script_path, "r", encoding="utf-8") as f:
+            source = f.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SchemaError(f"Could not read script: {exc}") from exc
 
     try:
         tree = ast.parse(source, filename=script_path)
