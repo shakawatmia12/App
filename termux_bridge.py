@@ -85,7 +85,12 @@ def build_run_command_from_content(content, filename, extra_args=None, log_path=
 
     mkdir = f"mkdir -p {shlex.quote(SCRIPTS_DIR)} {shlex.quote(os.path.dirname(target))}"
     write_script = f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(script_path)}"
-    run = f"python {shlex.quote(script_path)} {args}".strip()
+    # Redirect stdin from /dev/null: RUN_COMMAND runs headless with nobody
+    # able to type into it, so a script that calls input() would otherwise
+    # hang forever with zero output -- indistinguishable from "still
+    # running a slow network call". This turns that into an immediate,
+    # visible EOFError in the log instead, which is at least diagnosable.
+    run = f"python {shlex.quote(script_path)} {args} < /dev/null".strip()
     return f"{mkdir} && {write_script} && ({run}) 2>&1 | tee {shlex.quote(target)}"
 
 
