@@ -220,37 +220,42 @@ def _extract_prompt_text(call_node):
 
 _MENU_LINE_RE = re.compile(r'^\s*(\d+)\s*[.)\-:]\s*(.+?)\s*$')
 _SIMPLE_PRINT_RE = re.compile(r'^print\(\s*f?[\'"](.*)[\'"]\s*\)\s*$')
+_COMMENT_RE = re.compile(r'^\s*#')
 
 
-def _collect_menu_options(source_lines, input_lineno, max_lookback=20):
-    """Look for a plain `print("N. option")`-per-line menu immediately
-    above an input() call, and return (display_options, raw_values) if
-    one is recognized, else (None, None).
+def _collect_menu_options(source_lines, input_lineno, max_lookback=25):
+    """Look for a plain `print("N. option")`-per-line menu above an
+    input() call, and return (display_options, raw_values) if one is
+    recognized, else (None, None).
 
     Deliberately simple regex matching on raw source text rather than
-    full parsing: this only catches menus written as an unbroken run of
-    literal one-string-per-line print() calls right before the input()
-    that reads the choice (very common in hand-written CLI menus), and
-    safely finds nothing for anything more dynamic (a for-loop building
-    the menu, f-strings pulling from a list, etc.) rather than guessing.
+    full parsing. Blank lines and comments between the menu and the
+    input() (very common for readability) are skipped rather than
+    treated as "no menu here"; a single print() with embedded "\\n"
+    joining several options is also split apart. Anything that isn't a
+    blank/comment/matching print line stops the scan -- so a for-loop
+    building the menu dynamically, or unrelated code above the prompt,
+    safely yields no menu instead of a guess.
     """
     menu_texts = []
     idx = input_lineno - 2  # 0-indexed line immediately above the input() line
     checked = 0
     while idx >= 0 and checked < max_lookback:
+        checked += 1
         line = source_lines[idx].strip()
-        if not line:
-            break
+        if not line or _COMMENT_RE.match(line):
+            idx -= 1
+            continue
         match = _SIMPLE_PRINT_RE.match(line)
         if not match:
             break
-        menu_texts.insert(0, match.group(1))
+        for part in reversed(match.group(1).split("\\n")):
+            menu_texts.insert(0, part)
         idx -= 1
-        checked += 1
 
     options, raw_values = [], []
     for text in menu_texts:
-        m = _MENU_LINE_RE.match(text)
+        m = _MENU_LINE_RE.match(text.strip())
         if not m:
             return None, None
         raw_values.append(m.group(1))
