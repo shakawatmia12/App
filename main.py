@@ -213,7 +213,7 @@ class RootWidget(BoxLayout):
         )
         try:
             termux_bridge.open_termux()
-        except RuntimeError as exc:
+        except Exception as exc:
             self._append_output(f"[error] {exc}\n")
 
     # ---- Storage access (Android 11+ scoped storage) ----------------------
@@ -525,9 +525,15 @@ class RootWidget(BoxLayout):
         self._start_polling(termux_bridge.read_run_log)
 
     def _run_bridge_action(self, action):
+        # Broad except is deliberate: pyjnius/Android calls can raise all
+        # sorts of exception types (JavaException, AttributeError from a
+        # reflection miss, etc.), not just RuntimeError. An earlier
+        # version only caught RuntimeError here, so any other exception
+        # type from a Termux call went uncaught and crashed the whole app
+        # instead of just showing an [error] line.
         try:
             action()
-        except RuntimeError as exc:
+        except Exception as exc:
             self._append_output(f"[error] {exc}\n")
 
     def copy_output(self):
