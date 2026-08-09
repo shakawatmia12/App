@@ -10,14 +10,15 @@ source.include_exts = py,png,jpg,kv,atlas,json
 version = 1.0.0
 
 # main.py imports these; pyjnius drives the Termux RUN_COMMAND intent and
-# the storage-settings intent. File picking uses Kivy's own FileChooser
-# (not plyer) so it returns real filesystem paths instead of content:// URIs.
+# the storage-settings intent. plyer drives the file picker via Android's
+# Storage Access Framework (SAF) -- SAF is exempt from the scoped-storage
+# directory-listing restriction that broke Kivy's own raw FileChooser.
 # NOTE: do not pin kivy's version here. python-for-android's bundled
 # python3 recipe tracks a recent CPython (currently 3.14), and older Kivy
 # releases (e.g. 2.3.0) ship pre-generated Cython C code that fails to
 # compile against newer CPython C-API internals. Leaving kivy unpinned
 # lets pip resolve the latest release, which carries the compatibility fix.
-requirements = python3,kivy,pyjnius,android
+requirements = python3,kivy,pyjnius,plyer,android
 
 orientation = portrait
 fullscreen = 0

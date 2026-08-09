@@ -6,11 +6,8 @@ from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
 from kivy.lang import Builder
 from kivy.properties import StringProperty
-from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.button import Button
 from kivy.uix.checkbox import CheckBox
-from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.spinner import Spinner
@@ -25,12 +22,20 @@ try:
 except ImportError:
     ON_ANDROID = False
 
-# Root shared storage sits here on every real device; Termux (once
-# `termux-setup-storage` has run) sees the exact same tree, which is why
-# we browse it directly with Kivy's own FileChooser instead of Android's
-# SAF picker -- SAF hands back a content:// URI that neither our config
-# code nor Termux's shell can open as a plain file path.
-SDCARD_ROOT = "/sdcard"
+# NOTE on the back-and-forth in this file's history: we tried browsing
+# /sdcard directly with Kivy's own FileChooserListView (os.listdir), but
+# on Android 10+ that returns an EMPTY listing for any app whose
+# targetSdkVersion is 29+ -- scoped storage blocks raw directory
+# enumeration outright, permission grant or not. Android's own Storage
+# Access Framework (SAF) picker is exempt from that restriction because
+# the *system*, not our app, does the browsing. plyer's Android
+# filechooser drives SAF and resolves the result back to a real
+# filesystem path (via the externalstorage/media documents providers),
+# which is what both our own file reads and Termux need.
+try:
+    from plyer import filechooser
+except ImportError:
+    filechooser = None
 
 
 KV = """
@@ -231,34 +236,20 @@ class RootWidget(BoxLayout):
 
     # ---- Script selection -------------------------------------------------
     def pick_script(self):
-        chooser = FileChooserListView(
-            path=SDCARD_ROOT,
-            filters=["*.py"],
-            dirselect=False,
-        )
+        # Deliberately no `filters=` here: Android's SAF filters by MIME
+        # type and ".py" has no reliable MIME mapping on most devices --
+        # passing a filter made every .py file disappear from the picker.
+        # Show all files and validate the extension/content afterward.
+        if filechooser is not None:
+            filechooser.open_file(on_selection=self._on_file_selected, path="/sdcard")
+        else:
+            self._show_message("File chooser is unavailable on this platform.")
 
-        content = BoxLayout(orientation="vertical", spacing=dp(6))
-        content.add_widget(chooser)
-
-        button_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
-        cancel_btn = Button(text="Cancel")
-        select_btn = Button(text="Select")
-        button_row.add_widget(cancel_btn)
-        button_row.add_widget(select_btn)
-        content.add_widget(button_row)
-
-        popup = Popup(title="Select a .py script", content=content, size_hint=(0.95, 0.95))
-
-        def confirm(*_args):
-            if chooser.selection:
-                popup.dismiss()
-                self._load_script(chooser.selection[0])
-
-        select_btn.bind(on_release=confirm)
-        cancel_btn.bind(on_release=lambda *_a: popup.dismiss())
-        chooser.bind(on_submit=confirm)
-
-        popup.open()
+    def _on_file_selected(self, selection):
+        if not selection:
+            return
+        # plyer's callback can fire off the main thread; hop back onto it.
+        Clock.schedule_once(lambda dt: self._load_script(selection[0]))
 
     def _load_script(self, path):
         if not path.lower().endswith(".py"):
