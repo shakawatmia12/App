@@ -1,18 +1,22 @@
 """
 Universal Schema Template
 --------------------------
-Copy the SCHEMA dict below to the top of any Python script you want to run
-through the Termux Script Management Wrapper.
+SCHEMA is entirely optional. Any plain .py script using ordinary input()
+calls (numbered menus, plain questions, whatever) already works with the
+wrapper app with zero changes -- it runs your script for real inside
+Termux and shows buttons/an answer box for each prompt live, as your
+script actually asks for it. There's no SCHEMA "fields" list to author
+anymore; the app no longer tries to guess your script's questions ahead
+of time by reading its source.
 
-The wrapper reads this dict with `ast.literal_eval` (schema_engine.py), so
-it must contain only literal values: str, int, float, bool, list, dict.
-No function calls, no f-strings with expressions, no imports inside it.
+The only thing SCHEMA is still useful for is naming your script and
+hinting extra pip packages beyond what's auto-detected from your own
+`import` statements (needed only for something not directly imported,
+e.g. a package needed by a sub-dependency).
 
-You normally don't need to list every dependency in "packages" -- the
-wrapper also scans this file's own `import` statements and auto-detects
-third-party packages when you tap "Install Packages". Declare packages
-here only for things not directly imported (e.g. a package needed by a
-sub-dependency) or to be explicit.
+Copy the dict below to the top of your script if you want that; it must
+contain only literal values (str/int/float/bool/list/dict) -- the
+wrapper reads it with `ast.literal_eval`, never by executing your file.
 """
 
 SCHEMA = {
@@ -22,75 +26,4 @@ SCHEMA = {
     # Installed via: pkg install python -y && pip install <packages>
     # (merged with whatever this file's own `import` statements detect).
     "packages": ["requests", "bs4", "colorama"],
-
-    # UI fields rendered dynamically in the wrapper app.
-    # Supported types: "text", "number", "boolean", "select"
-    # "required": True marks a field that must be non-empty before Save
-    # Config / Run Script will proceed (checkboxes can't be "required",
-    # they're always either True or False).
-    "fields": [
-        {
-            "key": "target_url",
-            "type": "text",
-            "label": "Target URL",
-            "default": "https://example.com",
-            "required": True,
-        },
-        {
-            "key": "timeout",
-            "type": "number",
-            "label": "Timeout (seconds)",
-            "default": 30,
-        },
-        {
-            "key": "verbose",
-            "type": "boolean",
-            "label": "Verbose output",
-            "default": False,
-        },
-        {
-            "key": "mode",
-            "type": "select",
-            "label": "Run mode",
-            "options": ["safe", "fast", "stealth"],
-            "default": "safe",
-        },
-    ],
 }
-
-
-def load_saved_config():
-    """Read this script's own saved settings back from Termux's own dir.
-
-    The wrapper app's "Save Config" delegates the actual write to Termux
-    (Termux writes its own plain files with no restriction; the wrapper
-    app's process is scoped-storage-restricted on Android 10+ and can't
-    reliably write shared paths itself), landing at
-    /sdcard/termux_wrapper/configs/<sanitized script name>_config.json.
-    Must match termux_bridge.config_path_for()/schema_engine.
-    sanitize_name() exactly.
-    """
-    import json
-    import os
-    import re
-    import sys
-
-    def sanitize_name(name):
-        stem = os.path.splitext(name or "script")[0]
-        cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_")
-        return cleaned or "script"
-
-    script_name = sanitize_name(os.path.basename(sys.argv[0]))
-    config_path = f"/sdcard/termux_wrapper/configs/{script_name}_config.json"
-
-    if not os.path.isfile(config_path):
-        return {}
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-    return json.loads(content) if content else {}
-
-
-if __name__ == "__main__":
-    cfg = load_saved_config()
-    print("Loaded config:", cfg)

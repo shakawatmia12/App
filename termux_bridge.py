@@ -10,8 +10,14 @@ Design notes
   Explicit component intents are exempt from Android 11+ package-visibility
   filtering, so no `<queries>` manifest entry is required.
 * Termux's RUN_COMMAND intent does not stream stdout back to the caller in
-  real time. Every command is wrapped with `... 2>&1 | tee <logfile>` and
-  the app polls that logfile from Python (best-effort -- see read_log()).
+  real time, and there is no live pipe/pty shared between our app's
+  process and whatever Termux runs -- they are two entirely separate
+  Android apps. Every command is wrapped with `... 2>&1 | tee <logfile>`
+  and the app polls that logfile from Python (best-effort -- see
+  read_log()). Interactive step-by-step input (see
+  build_interactive_run_command below) works around the lack of a live
+  channel using a named pipe (FIFO) plus a small relay process, fed one
+  answer at a time by separate, independent RUN_COMMAND dispatches.
 * The user must enable `allow-external-apps=true` in
   `~/.termux/termux.properties` inside Termux itself, or Termux will
   silently refuse the RUN_COMMAND intent.
@@ -27,7 +33,6 @@ Design notes
   goes through copy_from_shared(), which stays entirely on our side.
 """
 import base64
-import json
 import os
 import shlex
 
@@ -45,6 +50,12 @@ SCRIPTS_DIR = f"{LOG_DIR}/scripts"
 CONFIGS_DIR = f"{LOG_DIR}/configs"
 INSTALL_LOG = f"{LOG_DIR}/install_output.log"
 RUN_LOG = f"{LOG_DIR}/run_output.log"
+RUN_PID_FILE = f"{SCRIPTS_DIR}/_last_run.pid"
+
+# Printed once a script's process has actually exited, so polling the log
+# can tell "finished" apart from "just quiet for a moment" -- see
+# build_interactive_run_command.
+DONE_MARKER = "___WRAPPER_SCRIPT_DONE___"
 
 # Termux enforces `allow-external-apps=true` in its own private
 # ~/.termux/termux.properties before it will honor a RUN_COMMAND intent
@@ -73,36 +84,53 @@ def build_install_command(packages, log_path=None):
     return f"{mkdir} && ({body}) 2>&1 | tee {shlex.quote(target)}"
 
 
-STDIN_FILE = f"{SCRIPTS_DIR}/_last_run_stdin.txt"
-ATTACHMENTS_DIR = f"{SCRIPTS_DIR}/attachments"
-RUN_PID_FILE = f"{SCRIPTS_DIR}/_last_run.pid"
+def _run_paths(filename):
+    """Per-script paths for the FIFO/answers-queue/feeder-pid trio used by
+    an interactive run -- named after the script so two different scripts
+    picked one after another don't collide on a leftover FIFO."""
+    import schema_engine
+
+    stem = schema_engine.sanitize_name(filename)
+    return {
+        "fifo": f"{SCRIPTS_DIR}/_run_{stem}.fifo",
+        "answers": f"{SCRIPTS_DIR}/_run_{stem}_answers.txt",
+        "feed_pid": f"{SCRIPTS_DIR}/_run_{stem}_feed.pid",
+    }
 
 
-def build_run_command_from_content(content, filename, extra_args=None, stdin_values=None,
-                                    attachments=None, log_path=None):
-    """Have Termux write the script's content to a path it owns, then run
-    it -- see the module docstring for why we hand Termux content instead
-    of a path we published via MediaStore.
+def build_interactive_run_command(content, filename, extra_args=None, preset_answers=None,
+                                   attachments=None, log_path=None):
+    """Run `content` inside Termux with its stdin wired to a named pipe
+    (FIFO) instead of a plain file, so answers can be fed to it ONE AT A
+    TIME while it's actually running, in response to what it actually
+    prints -- not pre-computed once, up front, from a static guess about
+    what it will ask.
 
-    stdin_values: when the script has no SCHEMA and main.py auto-detected
-    its input() calls (schema_engine.detect_inputs), this is the user's
-    answers in the same source order those calls appear in. They're
-    written to a plain file and redirected in as stdin, so the script's
-    own input() calls read them exactly as if someone had typed them --
-    without stdin_values, we redirect from /dev/null instead (see below).
+    Why a FIFO plus a separate relay ("feeder") process, instead of just
+    repeatedly doing `echo answer > fifo` from each new RUN_COMMAND: a
+    FIFO delivers EOF to its reader the instant its write end has NO open
+    writers left, even for a moment -- so a sequence of independent
+    short-lived `> fifo` writers (open, write one line, close) would hand
+    the script an EOFError the moment the FIRST one closes, well before a
+    second answer ever arrives. The feeder keeps the FIFO's write end
+    open for the script's *entire* run by holding it open itself
+    (`exec 3>fifo`) and relaying lines appended to a plain "answers" file
+    into it via `tail -f`; appending to a plain file from any later,
+    independent RUN_COMMAND has no such EOF hazard.
 
-    attachments: dict of {termux_plain_path: text_content} for any file
-    the user attached to a "file"-type auto-detected field (see
-    main.py._pick_attachment) -- picked via SAF/copy_from_shared on our
-    side, then handed to Termux the same base64-content way as the
-    script itself, since Termux can't read anything we'd publish via
-    MediaStore. The stdin value fed for that field is the path it ends
-    up at here, so the script's own open(path) call finds it.
+    preset_answers: an optional list of answers known up front (loaded
+    from a saved preset -- see build_save_preset_command) is pre-written
+    into the answers file before the script starts, so it runs hands-free
+    through however many of its prompts the preset covers, and only ever
+    falls back to waiting for a live answer (send_answer()) once/if it
+    asks for more than the preset provided.
     """
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     script_path = f"{SCRIPTS_DIR}/{filename}"
     target = log_path or RUN_LOG
     args = " ".join(shlex.quote(str(a)) for a in (extra_args or []))
+    paths = _run_paths(filename)
+    fifo, answers, feed_pid = paths["fifo"], paths["answers"], paths["feed_pid"]
 
     mkdir_dirs = {SCRIPTS_DIR, os.path.dirname(target)}
     write_parts = [f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(script_path)}"]
@@ -113,67 +141,119 @@ def build_run_command_from_content(content, filename, extra_args=None, stdin_val
             encoded_att = base64.b64encode(str(text).encode("utf-8", "replace")).decode("ascii")
             write_parts.append(f"echo {shlex.quote(encoded_att)} | base64 -d > {shlex.quote(path)}")
 
-    if stdin_values:
-        stdin_payload = "\n".join(str(v) for v in stdin_values) + "\n"
-        encoded_stdin = base64.b64encode(stdin_payload.encode("utf-8")).decode("ascii")
-        write_parts.append(f"echo {shlex.quote(encoded_stdin)} | base64 -d > {shlex.quote(STDIN_FILE)}")
-        stdin_redirect = f"< {shlex.quote(STDIN_FILE)}"
+    if preset_answers:
+        preset_payload = "\n".join(str(v) for v in preset_answers) + "\n"
+        encoded_preset = base64.b64encode(preset_payload.encode("utf-8")).decode("ascii")
+        seed_answers = f"echo {shlex.quote(encoded_preset)} | base64 -d > {shlex.quote(answers)}"
     else:
-        # Redirect from /dev/null: RUN_COMMAND runs headless with nobody
-        # able to type into it, so a script that calls input() would
-        # otherwise hang forever with zero output -- indistinguishable
-        # from "still running a slow network call". This turns that into
-        # an immediate, visible EOFError in the log instead.
-        stdin_redirect = "< /dev/null"
+        seed_answers = f": > {shlex.quote(answers)}"
 
     mkdir = f"mkdir -p {' '.join(shlex.quote(d) for d in mkdir_dirs)}"
     write_all = " && ".join(write_parts)
-    # -u (and PYTHONUNBUFFERED as a belt-and-braces backup for any
-    # subprocess the script itself spawns) forces unbuffered stdout.
-    # Without it, CPython block-buffers stdout whenever it isn't a real
-    # TTY -- which it never is here, since we pipe through `tee` -- so
-    # print()/input() prompts can sit invisible in a buffer for minutes
-    # even though the script is running fine, and look identical to a
-    # hang. This affects every script, not just one with a certain shape.
+
+    # `exec 3>fifo` opens the FIFO's write end and keeps it held on fd 3
+    # for as long as this backgrounded subshell lives; `tail -f` never
+    # exits on its own, so that write end stays open for the script's
+    # whole run, and every line later appended to `answers` (see
+    # build_send_answer_command) gets relayed straight into the FIFO.
+    setup = (
+        f"rm -f {shlex.quote(fifo)} && mkfifo {shlex.quote(fifo)} && "
+        f"{seed_answers} && "
+        f"( exec 3>{shlex.quote(fifo)}; tail -n +1 -f {shlex.quote(answers)} >&3 ) & "
+        f"echo $! > {shlex.quote(feed_pid)}"
+    )
+
+    # -u / PYTHONUNBUFFERED: CPython block-buffers stdout once it isn't a
+    # real TTY (true here regardless, since everything goes through
+    # `tee`), so prompts can sit invisible for a long time without this.
     run_inner = (
-        f"PYTHONUNBUFFERED=1 python -u {shlex.quote(script_path)} {args} {stdin_redirect}"
+        f"PYTHONUNBUFFERED=1 python -u {shlex.quote(script_path)} {args} < {shlex.quote(fifo)}"
     ).strip()
-    # Backgrounded with its PID recorded so a later Stop action
-    # (build_stop_command) can kill it -- RUN_COMMAND is fire-and-forget
-    # and gives no other way to reach a process once it's running.
-    run = f"{run_inner} & echo $! > {shlex.quote(RUN_PID_FILE)}; wait"
-    return f"{mkdir} && {write_all} && ({run}) 2>&1 | tee {shlex.quote(target)}"
+    run = f"{run_inner} & echo $! > {shlex.quote(RUN_PID_FILE)}; wait $(cat {shlex.quote(RUN_PID_FILE)})"
+    cleanup = f"kill $(cat {shlex.quote(feed_pid)}) 2>/dev/null; rm -f {shlex.quote(fifo)}"
+
+    return (
+        f"{mkdir} && {write_all} && {setup} && "
+        f"(({run}) 2>&1; echo {shlex.quote(DONE_MARKER)}) | tee {shlex.quote(target)}; {cleanup}"
+    )
 
 
-def build_stop_command():
+def build_send_answer_command(filename, value):
+    """Append one answer line to the running script's answers queue (see
+    build_interactive_run_command) -- the feeder relays it into the
+    script's stdin FIFO the moment it appears. Base64-encoded so an
+    arbitrary typed/pasted value (quotes, newlines) survives shell
+    quoting unscathed."""
+    paths = _run_paths(filename)
+    payload = str(value) + "\n"
+    encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+    return f"echo {shlex.quote(encoded)} | base64 -d >> {shlex.quote(paths['answers'])}"
+
+
+def send_answer(filename, value):
+    """Feed one answer to whatever script is currently running (see
+    run_script_interactive). Sent quietly in the background, like
+    save_config()/stop_script() -- there's no separate output to watch
+    for beyond the main run log, which keeps updating on its own."""
+    command = build_send_answer_command(filename, value)
+    send_termux_command(command, background=True)
+    return command
+
+
+def build_stop_command(filename):
+    paths = _run_paths(filename)
     return (
         f"if [ -f {shlex.quote(RUN_PID_FILE)} ]; then "
         f"kill $(cat {shlex.quote(RUN_PID_FILE)}) 2>/dev/null "
         f"&& echo 'Stop signal sent to the running script.' "
         f"|| echo 'The script had already finished.'; "
-        f"else echo 'No running script is being tracked.'; fi"
+        f"else echo 'No running script is being tracked.'; fi; "
+        f"kill $(cat {shlex.quote(paths['feed_pid'])}) 2>/dev/null; "
+        f"rm -f {shlex.quote(paths['fifo'])}"
     )
 
 
-def config_path_for(script_name):
+def presets_path_for(script_name):
     import schema_engine
 
-    return f"{CONFIGS_DIR}/{schema_engine.config_filename_for(script_name)}"
+    return f"{CONFIGS_DIR}/{schema_engine.sanitize_name(script_name)}_presets.json"
 
 
-def build_save_config_command(script_name, values):
-    """Have Termux write the config file under its own CONFIGS_DIR.
-
-    Values are base64-encoded so arbitrary JSON (quotes, newlines)
-    survives shell-command quoting unscathed.
+def build_save_preset_command(script_name, preset_name, answers):
+    """Have Termux merge one named preset (an ordered list of answers)
+    into that script's presets JSON file, keeping any other presets
+    already saved there. The merge itself runs as a tiny Python snippet
+    *inside Termux* (base64-transferred the same way a script itself is)
+    rather than trying to hand-roll a shell one-liner that reads-modifies-
+    writes JSON -- Termux always has Python available (it's this whole
+    app's baseline requirement), and repr() safely escapes the embedded
+    strings/lists as valid Python source, so there's no shell-quoting
+    hazard from whatever characters are in the answers themselves.
     """
-    config_path = config_path_for(script_name)
-    payload = json.dumps(values, indent=2, ensure_ascii=False)
-    encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
-
+    path = presets_path_for(script_name)
+    snippet = (
+        "import json\n"
+        f"path = {path!r}\n"
+        f"name = {preset_name!r}\n"
+        f"answers = {list(answers)!r}\n"
+        "try:\n"
+        "    with open(path, 'r', encoding='utf-8') as f:\n"
+        "        data = json.load(f)\n"
+        "    if not isinstance(data, dict):\n"
+        "        data = {}\n"
+        "except Exception:\n"
+        "    data = {}\n"
+        "data[name] = answers\n"
+        "with open(path, 'w', encoding='utf-8') as f:\n"
+        "    json.dump(data, f, indent=2, ensure_ascii=False)\n"
+        "print('Preset saved: ' + name)\n"
+    )
+    encoded_snippet = base64.b64encode(snippet.encode("utf-8")).decode("ascii")
+    snippet_path = f"{CONFIGS_DIR}/_save_preset.py"
     mkdir = f"mkdir -p {shlex.quote(CONFIGS_DIR)}"
-    write = f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(config_path)}"
-    return f"{mkdir} && {write} && echo 'Config saved to {config_path}'"
+    write = f"echo {shlex.quote(encoded_snippet)} | base64 -d > {shlex.quote(snippet_path)}"
+    run = f"python {shlex.quote(snippet_path)}"
+    return f"{mkdir} && {write} && {run}"
 
 
 def _to_java_string_array(items):
@@ -267,30 +347,33 @@ def install_packages(packages, log_path=None):
     return command
 
 
-def run_script_from_content(content, filename, extra_args=None, stdin_values=None,
-                             attachments=None, log_path=None):
+def run_script_interactive(content, filename, extra_args=None, preset_answers=None,
+                            attachments=None, log_path=None):
     """Run Script Action: Termux writes `content` to its own SCRIPTS_DIR
-    and runs it with `python`."""
-    command = build_run_command_from_content(
-        content, filename, extra_args, stdin_values=stdin_values,
+    and runs it with `python`, stdin wired to a FIFO for live step-by-step
+    answers -- see build_interactive_run_command."""
+    command = build_interactive_run_command(
+        content, filename, extra_args=extra_args, preset_answers=preset_answers,
         attachments=attachments, log_path=log_path,
     )
     send_termux_command(command)
     return command
 
 
-def stop_script():
+def stop_script(filename):
     """Best-effort kill of whatever Run Script last started (see the PID
-    file written in build_run_command_from_content). Sent quietly in the
-    background like save_config() -- there's no output to watch for."""
-    command = build_stop_command()
+    file written in build_interactive_run_command), plus its feeder
+    process and FIFO. Sent quietly in the background -- there's no
+    separate output to watch for."""
+    command = build_stop_command(filename)
     send_termux_command(command, background=True)
     return command
 
 
-def save_config(script_name, values):
-    """Save Config Action: delegate the actual file write to Termux."""
-    command = build_save_config_command(script_name, values)
+def save_preset(script_name, preset_name, answers):
+    """Save Config Action: persist the given answer sequence under a name
+    Termux can look up again later (see build_save_preset_command)."""
+    command = build_save_preset_command(script_name, preset_name, answers)
     send_termux_command(command, background=True)
     return command
 

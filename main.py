@@ -9,7 +9,6 @@ from kivy.metrics import dp
 from kivy.properties import ListProperty, StringProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
-from kivy.uix.checkbox import CheckBox
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.spinner import Spinner
@@ -44,10 +43,10 @@ except ImportError:
 #    can't read entries our app owns in MediaStore, even though it has
 #    full plain-filesystem access everywhere else (its own home dir, and
 #    any plain path under /sdcard it creates itself). So:
-#      - reading a picked file for OUR OWN purposes (schema parsing,
-#        import detection) uses copy_from_shared() into our private cache.
+#      - reading a picked file for OUR OWN purposes (import detection)
+#        uses copy_from_shared() into our private cache.
 #      - anything TERMUX needs to read or write (the script to run, its
-#        saved config, the one-time setup command) is transferred as
+#        saved presets, the one-time setup command) is transferred as
 #        base64-encoded CONTENT embedded in the shell command itself, so
 #        Termux writes it into a plain path under its own control
 #        (termux_bridge.LOG_DIR and friends) and never has to touch
@@ -102,12 +101,10 @@ KV = """
             width: dp(200)
             on_release: root.pick_script()
 
-        Button:
-            id: script_label
-            text: (root.script_name or "No script selected") + (" (tap for options)" if root.script_name else "")
+        Label:
+            text: root.script_name or "No script selected"
             shorten: True
             shorten_from: "left"
-            on_release: root.show_script_options()
 
     BoxLayout:
         size_hint_y: None
@@ -127,13 +124,36 @@ KV = """
             shorten_from: "right"
             text_size: self.width, None
 
-    ScrollView:
-        size_hint_y: 0.4
+    BoxLayout:
+        size_hint_y: None
+        height: dp(44)
+        spacing: dp(8)
 
-        GridLayout:
-            id: form_grid
-            cols: 1
-            spacing: dp(10)
+        Label:
+            text: "Preset:"
+            size_hint_x: None
+            width: dp(60)
+
+        Spinner:
+            id: preset_spinner
+            text: root.selected_preset
+            values: root.preset_names
+            on_text: root.on_preset_selected(self.text)
+
+    ScrollView:
+        size_hint_y: None
+        height: dp(220)
+        canvas.before:
+            Color:
+                rgba: 0.12, 0.12, 0.12, 1
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        BoxLayout:
+            id: step_panel
+            orientation: "vertical"
+            spacing: dp(6)
             padding: dp(6)
             size_hint_y: None
             height: self.minimum_height
@@ -191,7 +211,6 @@ KV = """
         text: root.output_text
         readonly: True
         multiline: True
-        size_hint_y: 0.4
         background_color: 0, 0, 0, 1
         foreground_color: 0, 1, 0, 1
         cursor_color: 0, 1, 0, 1
@@ -200,12 +219,16 @@ KV = """
 
 
 class RootWidget(BoxLayout):
+    MANUAL_LABEL = "Manual (no preset)"
+
     script_path = StringProperty("")
     script_name = StringProperty("")
     output_text = StringProperty("Output will appear here after you run a script.\n")
     status_text = StringProperty("Ready.")
     status_color = ListProperty([0.25, 0.25, 0.25, 1])
     run_button_text = StringProperty("Run Script")
+    preset_names = ListProperty(["Manual (no preset)"])
+    selected_preset = StringProperty("Manual (no preset)")
 
     STATUS_COLORS = {
         "info": [0.16, 0.32, 0.5, 1],
@@ -216,17 +239,22 @@ class RootWidget(BoxLayout):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.schema = schema_engine.default_schema("")
-        self.field_widgets = {}
+        self.declared_packages = []
+        self._presets = {}
         self._poll_event = None
         self._readable_script_path = ""
-        self._auto_field_mode = None  # None, "argparse", "argv", or "input"
+        self._current_filename = ""
         self._script_running = False
-        self._pending_attachment_key = None
-        self._attached_files = {}
-        self._attachment_labels = {}
         self._last_result_content = ""
         self._last_result_kind = None
+        # Interactive-run state: what's been printed since the last
+        # answer, how many quiet polling ticks that's been sitting for,
+        # whether the step UI is currently up, and every answer given so
+        # far this run (so Save Config can turn them into a preset).
+        self._pending_chunk = ""
+        self._quiet_ticks = 0
+        self._awaiting_input = False
+        self._collected_answers = []
 
         if ON_ANDROID and SharedStorage is not None and Chooser is not None:
             self.shared_storage = SharedStorage()
@@ -244,12 +272,6 @@ class RootWidget(BoxLayout):
         ~/.termux/termux.properties. No app can write that file for the
         user (that's Termux's whole point), so the best we can offer is:
         copy the command, open Termux, and let the user paste + Enter.
-        (An earlier version tried publishing this as a script file via
-        copy_to_shared() and pasting a short `bash "<path>"` instead, to
-        dodge a paste-corruption glitch seen on one device -- but Termux
-        can't read files published that way at all, confirmed separately,
-        so that approach is out. The plain command is self-contained: it
-        only ever touches Termux's own home directory.)
         """
         Clipboard.copy(termux_bridge.SETUP_COMMAND)
         self._append_output(
@@ -272,9 +294,7 @@ class RootWidget(BoxLayout):
         opening arbitrary paths like a script picked from anywhere in
         shared storage. That requires the MANAGE_EXTERNAL_STORAGE special
         permission, which can only be granted through a Settings screen --
-        no app can flip it for itself. Most flows no longer need this
-        (they go through androidstorage4kivy/SAF instead), but the plyer
-        fallback picker still benefits from it on Android 11+.
+        no app can flip it for itself.
         """
         if not ON_ANDROID:
             self._show_message("Storage access request only applies on Android.")
@@ -340,18 +360,13 @@ class RootWidget(BoxLayout):
     def _on_chooser_selection(self, shared_file_list):
         if not shared_file_list:
             return
-        if self._pending_attachment_key:
-            key = self._pending_attachment_key
-            self._pending_attachment_key = None
-            Clock.schedule_once(lambda dt: self._handle_picked_attachment(key, shared_file_list[0]))
-            return
         Clock.schedule_once(lambda dt: self._handle_picked_file(shared_file_list[0]))
 
     def _handle_picked_file(self, shared_file):
         """Read a SAF-picked file into our own private cache via
         androidstorage4kivy. That private copy is used for everything OUR
-        OWN process needs to do with it (schema parsing, import
-        detection) AND is what gets read fresh and embedded as content
+        OWN process needs to do with it (import detection for Install
+        Packages) AND is what gets read fresh and embedded as content
         when Termux needs to run it -- see the module-level NOTE above the
         imports for why we don't hand Termux a path instead.
         """
@@ -369,23 +384,12 @@ class RootWidget(BoxLayout):
             self._show_message(f"'{filename}' is not a .py file. Pick a Python script.")
             return
 
-        try:
-            schema = schema_engine.load_schema_from_file(private_path)
-        except schema_engine.SchemaError as exc:
-            self._show_message(self._friendly_error(exc))
-            return
-
-        self._apply_loaded_script(schema, private_path, filename)
+        self._apply_loaded_script(private_path, filename)
 
     def _on_file_selected(self, selection):
         if not selection:
             return
         path = selection[0]
-        if self._pending_attachment_key:
-            key = self._pending_attachment_key
-            self._pending_attachment_key = None
-            Clock.schedule_once(lambda dt: self._store_attachment(key, path))
-            return
         # plyer's callback can fire off the main thread; hop back onto it.
         Clock.schedule_once(lambda dt: self._load_script_from_plain_path(path))
 
@@ -398,327 +402,115 @@ class RootWidget(BoxLayout):
         if not path.lower().endswith(".py"):
             self._show_message(f"'{os.path.basename(path)}' is not a .py file. Pick a Python script.")
             return
+        self._apply_loaded_script(path, os.path.basename(path))
 
-        try:
-            schema = schema_engine.load_schema_from_file(path)
-        except schema_engine.SchemaError as exc:
-            self._show_message(self._friendly_error(exc))
-            return
-
-        self._apply_loaded_script(schema, path, os.path.basename(path))
-
-    # ---- File attachments for auto-detected "file" input() fields --------
-    def _pick_attachment(self, field_key):
-        self._pending_attachment_key = field_key
-        if self.chooser is not None:
-            self.chooser.choose_content("*/*")
-            return
-        if filechooser is not None:
-            try:
-                filechooser.open_file(on_selection=self._on_file_selected, path="/sdcard")
-            except Exception as exc:
-                self._pending_attachment_key = None
-                self._append_output(f"{self._friendly_error(exc)}\n")
-            return
-        self._pending_attachment_key = None
-        self._show_message("No file picker available on this device.")
-
-    def _handle_picked_attachment(self, field_key, shared_file):
-        try:
-            private_path = self.shared_storage.copy_from_shared(shared_file)
-        except Exception as exc:
-            self._append_output(f"{self._friendly_error(exc)}\n")
-            return
-        if not private_path:
-            self._append_output("[File Error] Could not read the attached file (no data returned).\n")
-            return
-        self._store_attachment(field_key, private_path)
-
-    def _store_attachment(self, field_key, path):
-        filename = os.path.basename(path)
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-        except OSError as exc:
-            self._append_output(f"{self._friendly_error(exc)}\n")
-            return
-
-        self._attached_files[field_key] = {"filename": filename, "content": content}
-        label_widget = self._attachment_labels.get(field_key)
-        if label_widget is not None:
-            label_widget.text = filename
-        field_label = self._field_label(field_key)
-        self._append_output(f"[attach] Attached '{filename}' for '{field_label}'.\n")
-
-    def _field_label(self, field_key):
-        entry = self.field_widgets.get(field_key)
-        return entry[0]["label"] if entry else field_key
-
-    def _apply_loaded_script(self, schema, readable_path, display_name):
-        self.schema = schema
+    def _apply_loaded_script(self, readable_path, display_name):
         self.script_path = readable_path
         self.script_name = display_name
         self._readable_script_path = readable_path
-        self._auto_field_mode = None
-        self._attached_files = {}
-        self._attachment_labels = {}
         self._script_running = False
         self.run_button_text = "Run Script"
+        self._collected_answers = []
+        self._pending_chunk = ""
+        self._quiet_ticks = 0
+        self._awaiting_input = False
+        self._clear_step_panel()
 
-        fields = schema_engine.get_fields(self.schema)
-        if not fields:
-            # No SCHEMA fields declared -- fall back to auto-detecting how
-            # the script itself takes input (argparse, sys.argv, or plain
-            # input() prompts -- see schema_engine.auto_detect_fields) and
-            # building a form from that, instead of leaving the user with
-            # nothing to configure and a script that will hang forever
-            # waiting for typed input it can never receive under Termux's
-            # headless RUN_COMMAND.
-            detected_fields, mode = schema_engine.auto_detect_fields(readable_path)
-            if detected_fields:
-                self.schema["fields"] = detected_fields
-                self._auto_field_mode = mode
-                fields = detected_fields
+        try:
+            schema = schema_engine.load_schema_from_file(readable_path)
+            self.declared_packages = schema_engine.get_packages(schema)
+        except schema_engine.SchemaError:
+            self.declared_packages = []
 
-        saved_values = self._load_saved_config()
-        self._build_form(saved_values)
+        self._presets = self._load_presets()
+        self.preset_names = [self.MANUAL_LABEL] + sorted(self._presets.keys())
+        self.selected_preset = self.MANUAL_LABEL
 
-        self._append_output(f"[schema] Loaded '{self.schema.get('name')}' "
-                             f"({len(fields)} fields, "
-                             f"{len(schema_engine.get_packages(self.schema))} packages)\n")
-        if self._auto_field_mode:
-            source_desc = {
-                "argparse": "argparse argument(s)",
-                "argv": "sys.argv positional argument(s)",
-                "input": "input() prompt(s)",
-            }[self._auto_field_mode]
-            feed_desc = (
-                "as command-line arguments" if self._auto_field_mode in ("argparse", "argv")
-                else "to the script's input() calls, in the same order they appear in its code"
-            )
+        self._append_output(
+            f"[script] Loaded '{self.script_name}'. Run Script executes it live "
+            "inside Termux -- if/when it asks a question, this app watches its "
+            "actual output and shows buttons or an answer box for it right here, "
+            "as it happens.\n"
+        )
+        if self._presets:
             self._append_output(
-                f"[schema] No SCHEMA found, but auto-detected {len(fields)} {source_desc} "
-                f"in this script. Fill them in below -- Run Script will feed your answers "
-                f"back {feed_desc}. This is a best-effort static scan, not a real "
-                "interpreter: a script whose options depend on runtime logic (an earlier "
-                "menu choice, a value computed at runtime) may not match exactly.\n"
+                f"[config] Found {len(self._presets)} saved preset(s) for this "
+                "script -- pick one from the Preset dropdown to auto-run without "
+                "answering by hand (it'll still ask you for anything beyond what "
+                "the preset covers).\n"
             )
-        elif not fields:
-            # Truly nothing to go on: no SCHEMA and no argparse/sys.argv/
-            # input() usage found either. Say so explicitly instead of
-            # leaving the user to guess why "No configurable options" is
-            # showing.
-            self._append_output(
-                f"[schema] {self.schema.get('description', '')} "
-                "To add configurable settings, put a SCHEMA dict with a "
-                "'fields' list at the top of this .py file (see "
-                "schema_template.py for the format), then reselect it.\n"
-            )
-        if saved_values:
-            self._append_output(f"[config] Restored previously saved settings for '{self.script_name}'.\n")
 
-    # ---- Per-script config: load, reset -----------------------------
-    def _load_saved_config(self):
-        """Best-effort read of this script's previously saved settings.
+    def _load_presets(self):
+        """Best-effort read of this script's saved presets.
 
         Termux owns this file (plain path under termux_bridge.CONFIGS_DIR,
-        written by save_config()'s embedded-content command) -- our own
-        process reading it directly can fail silently on Android 10+
-        scoped storage, in which case this just returns {} and the form
-        starts from schema defaults. Save Config itself is unaffected
-        either way: it doesn't depend on this read succeeding.
+        written by save_config()'s embedded snippet) -- our own process
+        reading it directly can fail silently on Android 10+ scoped
+        storage, in which case this just returns {} and only "Manual"
+        shows up in the dropdown.
         """
         if not self.script_name:
             return {}
-        config_path = termux_bridge.config_path_for(self.script_name)
-        return schema_engine.load_json_file(config_path)
+        path = termux_bridge.presets_path_for(self.script_name)
+        data = schema_engine.load_json_file(path)
+        return data if isinstance(data, dict) else {}
 
-    def show_script_options(self):
-        if not self.script_path:
-            return
-
-        content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
-        content.add_widget(Label(text=self.script_name))
-
-        button_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
-        reset_btn = Button(text="Reset/Delete Saved Settings")
-        cancel_btn = Button(text="Cancel")
-        button_row.add_widget(reset_btn)
-        button_row.add_widget(cancel_btn)
-        content.add_widget(button_row)
-
-        popup = Popup(title="Script Options", content=content, size_hint=(0.85, 0.35))
-
-        def do_reset(_instance):
-            popup.dismiss()
-            self.reset_config()
-
-        reset_btn.bind(on_release=do_reset)
-        cancel_btn.bind(on_release=lambda *_a: popup.dismiss())
-        popup.open()
-
-    def reset_config(self):
-        if not self.script_path:
-            self._show_message("Select a script first.")
-            return
-
-        config_path = termux_bridge.config_path_for(self.script_name)
-        try:
-            if os.path.isfile(config_path):
-                os.remove(config_path)
-        except OSError:
-            pass  # scoped storage may block this from our side; harmless
-
-        self._build_form({})
-        self._append_output(
-            f"[config] Reset form to defaults for '{self.script_name}' "
-            f"(the saved file at {config_path} will be overwritten next Save Config).\n"
-        )
-
-    # ---- Dynamic form -------------------------------------------------
-    def _build_form(self, saved_values=None):
-        saved_values = saved_values or {}
-        grid = self.ids.form_grid
-        grid.clear_widgets()
-        self.field_widgets = {}
-
-        fields = schema_engine.get_fields(self.schema)
-
-        if not fields:
-            grid.add_widget(Label(text="No configurable options", size_hint_y=None, height=44))
-            return
-
-        for field in fields:
-            value = saved_values.get(field["key"], field["default"])
-            grid.add_widget(self._make_field_row(field, value))
-
-    def _make_field_row(self, field, value):
-        """Label stacked directly above its widget, both full-width,
-        instead of squeezed side-by-side into two narrow grid columns.
-        Auto-detected labels (raw input() prompts, often with a "(e.g.
-        ...)" example tacked on) are frequently too long for half a phone
-        screen -- wrapped onto 2-3 lines next to a fixed-height widget in
-        a shared grid row, the row height and the widget's own height
-        fell out of sync and the two visually overlapped/ran outside
-        their box on-device. Stacking removes the side-by-side coupling
-        entirely: each field's own container just sums its children's
-        real heights.
-        """
-        label_text = field["label"] + (" *" if field.get("required") else "")
-        box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(2))
-        box.bind(minimum_height=box.setter("height"))
-
-        box.add_widget(self._make_label(label_text))
-        widget = self._make_field_widget(field, value)
-        self.field_widgets[field["key"]] = (field, widget)
-        box.add_widget(widget)
-        return box
-
-    def _make_label(self, text):
-        """Field labels can be long (auto-detected input() prompts easily
-        run past half the screen width) -- a plain fixed-height Label
-        with no text_size just overflows past its cell on both sides
-        instead of wrapping, which was cutting off the start of labels
-        like "Enter Usernames File...". Bind text_size to the label's own
-        width so it wraps, and height to the wrapped texture size so
-        multi-line labels don't get clipped either.
-        """
-        label = Label(text=text, size_hint_y=None, height=dp(30), halign="left", valign="middle")
-
-        def _sync_text_size(instance, value):
-            instance.text_size = (value, None)
-
-        def _sync_height(instance, value):
-            instance.height = max(dp(24), value[1])
-
-        label.bind(width=_sync_text_size, texture_size=_sync_height)
-        return label
-
-    def _make_field_widget(self, field, value):
-        ftype = field["type"]
-
-        if ftype == "boolean":
-            return CheckBox(active=bool(value), size_hint_y=None, height=44)
-
-        if ftype == "file":
-            row = BoxLayout(size_hint_y=None, height=44, spacing=dp(4))
-            existing = self._attached_files.get(field["key"])
-            name_label = Label(
-                text=existing["filename"] if existing else "No file selected",
-                shorten=True,
-                shorten_from="left",
-            )
-            name_label.bind(size=lambda inst, val: setattr(inst, "text_size", (val[0], None)))
-            browse_btn = Button(text="Browse", size_hint_x=None, width=dp(90))
-            browse_btn.bind(on_release=lambda *_a, k=field["key"]: self._pick_attachment(k))
-            row.add_widget(name_label)
-            row.add_widget(browse_btn)
-            self._attachment_labels[field["key"]] = name_label
-            return row
-
-        if ftype == "select":
-            options = field.get("options", [])
-            return Spinner(
-                text=str(value) if value else (options[0] if options else ""),
-                values=options,
-                size_hint_y=None,
-                height=44,
-            )
-
-        return TextInput(
-            text=str(value),
-            multiline=False,
-            input_filter="float" if ftype == "number" else None,
-            size_hint_y=None,
-            height=44,
-        )
-
-    def _collect_form_values(self):
-        values = {}
-        for key, (field, widget) in self.field_widgets.items():
-            if field["type"] == "boolean":
-                raw = widget.active
-            elif field["type"] == "file":
-                raw = self._attached_files.get(key, {}).get("filename", "")
-            else:
-                raw = widget.text
-            values[key] = schema_engine.cast_field_value(field, raw)
-        return values
-
-    def _missing_required_fields(self):
-        missing = []
-        for _key, (field, widget) in self.field_widgets.items():
-            if not field.get("required"):
-                continue
-            if field["type"] in ("boolean", "file"):
-                continue  # no plain "empty" state for these
-            if not str(widget.text).strip():
-                missing.append(field["label"])
-        return missing
+    def on_preset_selected(self, value):
+        self.selected_preset = value
 
     # ---- Actions -------------------------------------------------
     def save_config(self):
+        """Persist the answers given during the last/current interactive
+        run as a named, reusable preset."""
         if not self.script_path:
             self._show_message("Select a script first.")
-            return False
+            return
         if not self._check_termux_ready():
-            return False
+            return
+        if not self._collected_answers:
+            self._show_message(
+                "No answers recorded yet -- run the script and answer at least "
+                "one prompt first, then Save Config."
+            )
+            return
+        self._prompt_preset_name()
 
-        missing = self._missing_required_fields()
-        if missing:
-            msg = f"[Config Error] Required setting field empty: {', '.join(missing)}."
-            self._append_output(f"{msg} Please configure before running.\n")
-            self._set_status(msg, "error")
-            return False
+    def _prompt_preset_name(self):
+        content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(10))
+        content.add_widget(Label(
+            text=f"Save this run's {len(self._collected_answers)} answer(s) as a preset named:",
+            size_hint_y=None, height=dp(30),
+        ))
+        default_name = self.selected_preset if self.selected_preset != self.MANUAL_LABEL else ""
+        name_input = TextInput(text=default_name, multiline=False, size_hint_y=None, height=dp(44))
+        content.add_widget(name_input)
+        btn_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        cancel_btn = Button(text="Cancel")
+        ok_btn = Button(text="Save")
+        btn_row.add_widget(cancel_btn)
+        btn_row.add_widget(ok_btn)
+        content.add_widget(btn_row)
+        popup = Popup(title="Save Config", content=content, size_hint=(0.85, 0.35))
 
-        values = self._collect_form_values()
-        config_path = termux_bridge.config_path_for(self.script_name)
-        self._append_output(f"[config] Saving settings to {config_path} via Termux...\n")
-        self._set_status("Sending Save Config to Termux...", "info")
-        if not self._run_bridge_action(lambda: termux_bridge.save_config(self.script_name, values)):
-            return False
-        self._set_status("Save Config sent to Termux.", "success")
-        return True
+        def _do_save(*_a):
+            name = name_input.text.strip()
+            if not name:
+                self._show_message("Enter a preset name.")
+                return
+            popup.dismiss()
+            answers = list(self._collected_answers)
+            self._append_output(f"[config] Saving preset '{name}' ({len(answers)} answer(s)) via Termux...\n")
+            self._set_status("Sending Save Config to Termux...", "info")
+            if self._run_bridge_action(lambda: termux_bridge.save_preset(self.script_name, name, answers)):
+                self._presets[name] = answers
+                if name not in self.preset_names:
+                    self.preset_names = self.preset_names + [name]
+                self.selected_preset = name
+                self._set_status(f"Preset '{name}' saved.", "success")
+
+        ok_btn.bind(on_release=_do_save)
+        cancel_btn.bind(on_release=lambda *_a: popup.dismiss())
+        popup.open()
 
     def install_packages(self):
         if not self.script_path:
@@ -727,14 +519,13 @@ class RootWidget(BoxLayout):
         if not self._check_termux_ready():
             return
 
-        declared = schema_engine.get_packages(self.schema)
         detected = []
         if self._readable_script_path:
             detected = schema_engine.detect_imports(self._readable_script_path)
-        packages = sorted(set(declared) | set(detected))
+        packages = sorted(set(self.declared_packages) | set(detected))
 
         note = ""
-        new_from_detection = sorted(set(detected) - set(declared))
+        new_from_detection = sorted(set(detected) - set(self.declared_packages))
         if new_from_detection:
             note = f" (auto-detected from imports: {', '.join(new_from_detection)})"
         self._append_output(
@@ -754,14 +545,18 @@ class RootWidget(BoxLayout):
             self.run_script()
 
     def stop_script(self):
-        """Best-effort: send a kill for whatever Run Script last started.
-        Safe to press even if the script already finished on its own --
-        termux_bridge.build_stop_command() just reports that instead.
+        """Best-effort: send a kill for whatever Run Script last started
+        (and its FIFO feeder). Safe to press even if the script already
+        finished on its own -- termux_bridge.build_stop_command() just
+        reports that instead.
         """
         self._append_output("[run] Sending stop signal to Termux...\n")
-        self._run_bridge_action(termux_bridge.stop_script)
+        filename = self._current_filename or os.path.basename(self._readable_script_path or "")
+        self._run_bridge_action(lambda: termux_bridge.stop_script(filename))
         self._script_running = False
         self.run_button_text = "Run Script"
+        self._awaiting_input = False
+        self._clear_step_panel()
         if self._poll_event:
             self._poll_event.cancel()
         self._set_status("Stop signal sent.", "warn")
@@ -771,8 +566,6 @@ class RootWidget(BoxLayout):
             self._show_message("Select a script first.")
             return
         if not self._check_termux_ready():
-            return
-        if not self.save_config():
             return
 
         try:
@@ -785,71 +578,108 @@ class RootWidget(BoxLayout):
             return
 
         filename = os.path.basename(self._readable_script_path)
+        self._current_filename = filename
 
-        stdin_values = None
-        extra_args = None
-        attachments = {}
+        preset_answers = None
+        if self.selected_preset and self.selected_preset != self.MANUAL_LABEL:
+            preset_answers = list(self._presets.get(self.selected_preset, []))
+            self._append_output(
+                f"[run] Using preset '{self.selected_preset}' -- {len(preset_answers)} "
+                "answer(s) will be sent automatically. If the script asks for more "
+                "than that, this app will prompt you for the rest live.\n"
+            )
 
-        if self._auto_field_mode:
-            fields = schema_engine.get_fields(self.schema)
-            values = self._collect_form_values()
-
-            # "file" fields are transferred as attachments regardless of
-            # mode (argparse/argv/input); the answer fed back becomes the
-            # Termux path the content actually landed at.
-            for f in fields:
-                if f["type"] == "file":
-                    key = f["key"]
-                    attached = self._attached_files.get(key)
-                    if attached:
-                        termux_path = f"{termux_bridge.ATTACHMENTS_DIR}/{attached['filename']}"
-                        attachments[termux_path] = attached["content"]
-                        values[key] = termux_path
-                    else:
-                        values[key] = ""
-
-            if self._auto_field_mode == "input":
-                # Feed answers to the script's own input() calls, in the
-                # same source order schema_engine.detect_inputs found them.
-                stdin_values = []
-                for f in fields:
-                    val = values.get(f["key"], "")
-                    # Auto-detected dropdowns display "N) description" but
-                    # the script itself only ever typed a bare number into
-                    # its input() -- translate back to that raw value.
-                    option_values = f.get("_option_values")
-                    options = f.get("options")
-                    if option_values and options and val in options:
-                        val = option_values[options.index(val)]
-                    stdin_values.append(str(val))
-                self._append_output(
-                    f"[run] Feeding {len(stdin_values)} answer(s) to the script's input() calls...\n"
-                )
-            else:
-                # argparse / sys.argv -- build the actual argv list.
-                extra_args = schema_engine.build_cli_args(fields, values)
-                self._append_output(
-                    f"[run] Launching with arguments: {' '.join(extra_args) or '(none)'}\n"
-                )
-
-        attachments = attachments or None
+        self._collected_answers = []
+        self._pending_chunk = ""
+        self._quiet_ticks = 0
+        self._awaiting_input = False
+        self._clear_step_panel()
 
         self._append_output(f"[run] Launching {self.script_name} in Termux...\n")
         self._set_status("Sending Run Script command to Termux...", "info")
         if not self._run_bridge_action(
-            lambda: termux_bridge.run_script_from_content(
-                content, filename, extra_args=extra_args,
-                stdin_values=stdin_values, attachments=attachments,
+            lambda: termux_bridge.run_script_interactive(
+                content, filename, preset_answers=preset_answers,
             )
         ):
             return
         self._script_running = True
         self.run_button_text = "Stop Script"
         self._set_status("Sent -- waiting for Termux output...", "info")
-        # A longer grace period than Install Packages: user scripts can make
-        # slow network calls (translation APIs, requests, etc.) before
-        # printing anything at all, so 16s is too eager here.
-        self._start_polling(termux_bridge.read_run_log, silence_timeout_s=30)
+        self._start_polling(termux_bridge.read_run_log, silence_timeout_s=30, interactive=True)
+
+    # ---- Interactive step UI --------------------------------------------
+    def _clear_step_panel(self):
+        panel = self.ids.get("step_panel") if hasattr(self, "ids") else None
+        if panel is not None:
+            panel.clear_widgets()
+
+    def _show_step_ui(self, chunk):
+        """Build buttons/inputs from whatever the script printed since the
+        last answer (see schema_engine.parse_menu_options/last_prompt_line)
+        -- these read the script's REAL rendered output, so it doesn't
+        matter how the script's source built that text (colour codes,
+        f-strings, a loop, argparse, anything)."""
+        self._awaiting_input = True
+        prompt = schema_engine.last_prompt_line(chunk)
+        options, raw_values = schema_engine.parse_menu_options(chunk)
+
+        panel = self.ids.step_panel
+        panel.clear_widgets()
+
+        if prompt:
+            panel.add_widget(self._step_label(f"Waiting: {prompt}"))
+
+        if options:
+            for opt, raw in zip(options, raw_values):
+                btn = Button(text=opt, size_hint_y=None, height=dp(40))
+                btn.bind(on_release=lambda *_a, v=raw: self._submit_answer(v))
+                panel.add_widget(btn)
+
+        answer_input = TextInput(multiline=False, size_hint_y=None, height=dp(40))
+
+        quick_row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(6))
+        if schema_engine.prompt_wants_number_chips(prompt):
+            for chip in ("1", "5", "10", "25"):
+                cbtn = Button(text=chip, size_hint_x=None, width=dp(48))
+                cbtn.bind(on_release=lambda *_a, v=chip: self._submit_answer(v))
+                quick_row.add_widget(cbtn)
+        if schema_engine.prompt_wants_paste_button(prompt):
+            paste_btn = Button(text="Paste", size_hint_x=None, width=dp(70))
+            paste_btn.bind(on_release=lambda *_a: setattr(answer_input, "text", Clipboard.paste()))
+            quick_row.add_widget(paste_btn)
+        if quick_row.children:
+            panel.add_widget(quick_row)
+
+        send_btn = Button(text="Send", size_hint_x=None, width=dp(70))
+        send_btn.bind(on_release=lambda *_a: self._submit_answer(answer_input.text))
+        input_row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(6))
+        input_row.add_widget(answer_input)
+        input_row.add_widget(send_btn)
+        panel.add_widget(input_row)
+
+    def _step_label(self, text):
+        label = Label(text=text, size_hint_y=None, height=dp(30), halign="left",
+                       valign="middle", color=(1, 0.85, 0.3, 1))
+
+        def _sync_text_size(instance, value):
+            instance.text_size = (value, None)
+
+        def _sync_height(instance, value):
+            instance.height = max(dp(24), value[1])
+
+        label.bind(width=_sync_text_size, texture_size=_sync_height)
+        return label
+
+    def _submit_answer(self, value):
+        value = str(value)
+        self._collected_answers.append(value)
+        self._append_output(f"[you] {value}\n")
+        self._run_bridge_action(lambda: termux_bridge.send_answer(self._current_filename, value))
+        self._awaiting_input = False
+        self._pending_chunk = ""
+        self._quiet_ticks = 0
+        self._clear_step_panel()
 
     def _check_termux_ready(self):
         """Verify Termux is actually installed before firing a command at
@@ -946,16 +776,22 @@ class RootWidget(BoxLayout):
         return f"[Error] {text}"
 
     # ---- Output polling -------------------------------------------------
-    def _start_polling(self, reader, silence_timeout_s=16):
+    def _start_polling(self, reader, silence_timeout_s=16, interactive=False):
         """Poll `reader` every 2s for fresh output.
 
         `reader` reads a plain path Termux wrote to directly (see
         termux_bridge.read_log's docstring) -- this can come back empty on
         Android 10+ scoped storage even once Termux has genuinely finished,
-        since our own process may simply be unable to see the file. If
-        nothing at all comes back within `silence_timeout_s`, surface the
-        most likely reason (Termux never accepted the command) while being
-        clear that checking Termux directly is always the reliable option.
+        since our own process may simply be unable to see the file.
+
+        When `interactive` is set (Run Script, not Install Packages): a
+        stretch with no new output is treated as "the script is probably
+        blocked on its next prompt" and triggers the step UI (see
+        _show_step_ui) from whatever's been printed since the last
+        answer, instead of just showing a generic "no output" warning.
+        Termux appends termux_bridge.DONE_MARKER once the script's
+        process has actually exited, which is how this tells "finished"
+        apart from "quiet for a moment".
         """
         if self._poll_event:
             self._poll_event.cancel()
@@ -963,26 +799,42 @@ class RootWidget(BoxLayout):
         state = {"ticks": 0, "got_output": False, "hinted": False, "last_content": ""}
         max_ticks = max(1, silence_timeout_s // 2)
 
+        def finish_run():
+            self._script_running = False
+            self.run_button_text = "Run Script"
+            self._awaiting_input = False
+            self._clear_step_panel()
+            if self._poll_event:
+                self._poll_event.cancel()
+            if self._collected_answers:
+                self._append_output(
+                    f"[run] Finished. {len(self._collected_answers)} answer(s) were "
+                    "given this run -- tap Save Config to store them as a reusable "
+                    "preset.\n"
+                )
+
         def poll(_dt):
             content = reader()
             if content and content != state["last_content"]:
                 # Termux's `tee` truncates and rewrites the log file fresh
                 # each run, so `content` usually grows on each poll while
-                # the command is still running. Append only the new suffix
-                # instead of replacing self.output_text wholesale -- a full
-                # replace here previously wiped out our own status lines
-                # ([schema]/[install] messages) and, combined with a
-                # Label+ScrollView height-binding quirk, could leave the
-                # box looking completely blank even though real output had
-                # been read successfully.
+                # the command is still running. Append only the new
+                # suffix instead of replacing self.output_text wholesale.
                 if content.startswith(state["last_content"]):
                     new_part = content[len(state["last_content"]):]
                 else:
                     new_part = content
-                if new_part.strip():
-                    self._append_output(new_part if new_part.endswith("\n") else new_part + "\n")
                 state["last_content"] = content
                 state["got_output"] = True
+
+                done = interactive and termux_bridge.DONE_MARKER in new_part
+                visible_part = new_part.replace(termux_bridge.DONE_MARKER, "") if done else new_part
+                if visible_part.strip():
+                    self._append_output(visible_part if visible_part.endswith("\n") else visible_part + "\n")
+                    if interactive:
+                        self._pending_chunk += visible_part
+                        self._quiet_ticks = 0
+
                 status_text, kind = self._classify_output(content)
                 self._set_status(status_text, kind)
                 # Track the raw Termux result separately from output_text
@@ -991,24 +843,37 @@ class RootWidget(BoxLayout):
                 # actual result instead of the whole noisy log.
                 self._last_result_content = content
                 self._last_result_kind = kind
+
+                if done:
+                    finish_run()
                 return
 
-            if state["got_output"] or state["hinted"]:
+            if not interactive:
+                if state["got_output"] or state["hinted"]:
+                    return
+                state["ticks"] += 1
+                if state["ticks"] >= max_ticks:
+                    state["hinted"] = True
+                    msg = f"No output yet after {silence_timeout_s}s -- still checking automatically."
+                    self._set_status(msg, "warn")
+                    self._append_output(
+                        f"[Termux] {msg} This box updates itself the moment Termux writes "
+                        "anything, so if your script makes network calls it may simply "
+                        "still be running -- no need to tap anything again. If this "
+                        "never changes after a couple of minutes, confirm 'Setup Termux' "
+                        "was pasted + Enter inside Termux (not just tapped).\n"
+                    )
                 return
 
-            state["ticks"] += 1
-            if state["ticks"] >= max_ticks:
-                state["hinted"] = True
-                msg = f"No output yet after {silence_timeout_s}s -- still checking automatically."
-                self._set_status(msg, "warn")
-                self._append_output(
-                    f"[Termux] {msg} This box updates itself the moment Termux writes "
-                    "anything, so if your script makes network calls (translation, "
-                    "requests, APIs) it may simply still be running -- no need to tap "
-                    "anything again. If this never changes after a couple of minutes, "
-                    "confirm 'Setup Termux' was pasted + Enter inside Termux (not just "
-                    "tapped), or open Termux directly to see what it's doing.\n"
-                )
+            # Interactive mode: no new output this tick. Once it's been
+            # quiet for a couple of ticks (~4s) and there's something
+            # pending from before, treat that as the script blocking on
+            # its next prompt and show buttons/an answer box for it.
+            if self._awaiting_input:
+                return
+            self._quiet_ticks += 1
+            if self._quiet_ticks == 2 and self._pending_chunk.strip():
+                self._show_step_ui(self._pending_chunk)
 
         self._poll_event = Clock.schedule_interval(poll, 2)
 
