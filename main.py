@@ -79,6 +79,22 @@ KV = """
             shorten: True
             shorten_from: "left"
 
+    BoxLayout:
+        size_hint_y: None
+        height: dp(40)
+        spacing: dp(8)
+
+        TextInput:
+            id: manual_path_input
+            hint_text: "Or type the full path, e.g. /storage/emulated/0/Download/multi3.py"
+            multiline: False
+
+        Button:
+            text: "Load Path"
+            size_hint_x: None
+            width: dp(110)
+            on_release: root.load_manual_path(manual_path_input.text)
+
     ScrollView:
         size_hint_y: 0.35
 
@@ -240,16 +256,37 @@ class RootWidget(BoxLayout):
         # type and ".py" has no reliable MIME mapping on most devices --
         # passing a filter made every .py file disappear from the picker.
         # Show all files and validate the extension/content afterward.
-        if filechooser is not None:
-            filechooser.open_file(on_selection=self._on_file_selected, path="/sdcard")
-        else:
+        if filechooser is None:
             self._show_message("File chooser is unavailable on this platform.")
+            return
+        try:
+            filechooser.open_file(on_selection=self._on_file_selected, path="/sdcard")
+        except Exception as exc:
+            self._append_output(f"[error] Could not open file picker: {exc}\n")
 
     def _on_file_selected(self, selection):
+        # Log whatever plyer hands back, even empty/odd values -- some
+        # picker sources (Recent files, cloud providers) return a
+        # content:// URI plyer can't resolve to a real path, and this is
+        # the only way to see that without device logcat access.
+        self._append_output(f"[picker] Selection returned: {selection!r}\n")
         if not selection:
+            self._append_output(
+                "[picker] Empty selection -- either you cancelled, or this "
+                "picker source doesn't hand back a usable path. Try 'My "
+                "Files' > Internal storage directly, or use 'Load Path' "
+                "below with the file's full path typed in.\n"
+            )
             return
         # plyer's callback can fire off the main thread; hop back onto it.
         Clock.schedule_once(lambda dt: self._load_script(selection[0]))
+
+    def load_manual_path(self, path):
+        path = path.strip()
+        if not path:
+            self._show_message("Type a full file path first.")
+            return
+        self._load_script(path)
 
     def _load_script(self, path):
         if not path.lower().endswith(".py"):
