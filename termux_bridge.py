@@ -137,21 +137,29 @@ def send_termux_command(shell_command, session_action="0", background=False):
 
     activity = PythonActivity.mActivity
 
+    # Wrap every string extra in an explicit java.lang.String instead of
+    # handing pyjnius a plain Python str: Intent.putExtra() has ~15
+    # overloads (String, CharSequence, boolean, int, String[], ...), and
+    # jnius' automatic type coercion has already misfired twice elsewhere
+    # in this project (RUN_COMMAND_ARGUMENTS, a ContentResolver.query()
+    # call) picking an unintended overload. Termux itself reported
+    # "Mandatory extra missing" for RUN_COMMAND_PATH on a real device even
+    # though it was being set -- consistent with the String value landing
+    # in the intent as the wrong extra type, so getStringExtra() finds
+    # nothing. Explicit String() construction removes the ambiguity.
+    JString = autoclass("java.lang.String")
+
     intent = Intent()
     intent.setClassName(TERMUX_PACKAGE, TERMUX_SERVICE)
     intent.setAction(TERMUX_ACTION)
-    intent.putExtra("com.termux.RUN_COMMAND_PATH", TERMUX_BASH)
-    intent.putExtra("com.termux.RUN_COMMAND_WORKDIR", TERMUX_HOME)
+    intent.putExtra("com.termux.RUN_COMMAND_PATH", JString(TERMUX_BASH))
+    intent.putExtra("com.termux.RUN_COMMAND_WORKDIR", JString(TERMUX_HOME))
     intent.putExtra("com.termux.RUN_COMMAND_BACKGROUND", bool(background))
-    intent.putExtra("com.termux.RUN_COMMAND_SESSION_ACTION", str(session_action))
-
-    try:
-        intent.putExtra("com.termux.RUN_COMMAND_ARGUMENTS", ["-c", shell_command])
-    except Exception:
-        intent.putExtra(
-            "com.termux.RUN_COMMAND_ARGUMENTS",
-            _to_java_string_array(["-c", shell_command]),
-        )
+    intent.putExtra("com.termux.RUN_COMMAND_SESSION_ACTION", JString(str(session_action)))
+    intent.putExtra(
+        "com.termux.RUN_COMMAND_ARGUMENTS",
+        _to_java_string_array(["-c", shell_command]),
+    )
 
     # Plain framework Activity methods instead of androidx.core's
     # ContextCompat.startForegroundService(): buildozer/p4a's default
