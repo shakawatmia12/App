@@ -128,16 +128,15 @@ KV = """
             text_size: self.width, None
 
     ScrollView:
-        size_hint_y: 0.35
+        size_hint_y: 0.4
 
         GridLayout:
             id: form_grid
-            cols: 2
-            spacing: dp(6)
+            cols: 1
+            spacing: dp(10)
             padding: dp(6)
             size_hint_y: None
             height: self.minimum_height
-            row_force_default: False
 
     BoxLayout:
         size_hint_y: None
@@ -192,7 +191,7 @@ KV = """
         text: root.output_text
         readonly: True
         multiline: True
-        size_hint_y: 0.45
+        size_hint_y: 0.4
         background_color: 0, 0, 0, 1
         foreground_color: 0, 1, 0, 1
         cursor_color: 0, 1, 0, 1
@@ -587,16 +586,33 @@ class RootWidget(BoxLayout):
 
         if not fields:
             grid.add_widget(Label(text="No configurable options", size_hint_y=None, height=44))
-            grid.add_widget(Label(text="", size_hint_y=None, height=44))
             return
 
         for field in fields:
-            label_text = field["label"] + (" *" if field.get("required") else "")
-            grid.add_widget(self._make_label(label_text))
             value = saved_values.get(field["key"], field["default"])
-            widget = self._make_field_widget(field, value)
-            self.field_widgets[field["key"]] = (field, widget)
-            grid.add_widget(widget)
+            grid.add_widget(self._make_field_row(field, value))
+
+    def _make_field_row(self, field, value):
+        """Label stacked directly above its widget, both full-width,
+        instead of squeezed side-by-side into two narrow grid columns.
+        Auto-detected labels (raw input() prompts, often with a "(e.g.
+        ...)" example tacked on) are frequently too long for half a phone
+        screen -- wrapped onto 2-3 lines next to a fixed-height widget in
+        a shared grid row, the row height and the widget's own height
+        fell out of sync and the two visually overlapped/ran outside
+        their box on-device. Stacking removes the side-by-side coupling
+        entirely: each field's own container just sums its children's
+        real heights.
+        """
+        label_text = field["label"] + (" *" if field.get("required") else "")
+        box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(2))
+        box.bind(minimum_height=box.setter("height"))
+
+        box.add_widget(self._make_label(label_text))
+        widget = self._make_field_widget(field, value)
+        self.field_widgets[field["key"]] = (field, widget)
+        box.add_widget(widget)
+        return box
 
     def _make_label(self, text):
         """Field labels can be long (auto-detected input() prompts easily
@@ -607,13 +623,13 @@ class RootWidget(BoxLayout):
         width so it wraps, and height to the wrapped texture size so
         multi-line labels don't get clipped either.
         """
-        label = Label(text=text, size_hint_y=None, height=dp(44), halign="left", valign="middle")
+        label = Label(text=text, size_hint_y=None, height=dp(30), halign="left", valign="middle")
 
         def _sync_text_size(instance, value):
             instance.text_size = (value, None)
 
         def _sync_height(instance, value):
-            instance.height = max(dp(44), value[1] + dp(10))
+            instance.height = max(dp(24), value[1])
 
         label.bind(width=_sync_text_size, texture_size=_sync_height)
         return label
@@ -684,6 +700,8 @@ class RootWidget(BoxLayout):
     def save_config(self):
         if not self.script_path:
             self._show_message("Select a script first.")
+            return False
+        if not self._check_termux_ready():
             return False
 
         missing = self._missing_required_fields()
@@ -862,6 +880,18 @@ class RootWidget(BoxLayout):
         except Exception as exc:
             msg = self._friendly_error(exc)
             self._append_output(f"{msg}\n")
+            # The friendly message above deliberately hides the raw
+            # exception text behind a canned, actionable sentence -- but
+            # that means real diagnosis of *why* Termux rejected a given
+            # command (a SecurityException with a specific permission
+            # name, vs. a plain timing issue) has no evidence to go on.
+            # Logging the raw text too costs nothing for a normal user
+            # (it's just more lines in a log box they can ignore) and
+            # turns the next report of this into something fixable
+            # instead of another guess.
+            detail = str(exc).strip()
+            if detail:
+                self._append_output(f"[Debug] {type(exc).__name__}: {detail}\n")
             self._set_status(msg, "error")
             return False
         return True
