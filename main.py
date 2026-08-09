@@ -174,6 +174,19 @@ KV = """
             width: dp(140)
             on_release: root.copy_output()
 
+    BoxLayout:
+        size_hint_y: None
+        height: dp(40)
+        spacing: dp(6)
+
+        Button:
+            text: "Copy Success Result"
+            on_release: root.copy_success_result()
+
+        Button:
+            text: "Copy Fail Result"
+            on_release: root.copy_fail_result()
+
     TextInput:
         id: output_label
         text: root.output_text
@@ -213,6 +226,8 @@ class RootWidget(BoxLayout):
         self._pending_attachment_key = None
         self._attached_files = {}
         self._attachment_labels = {}
+        self._last_result_content = ""
+        self._last_result_kind = None
 
         if ON_ANDROID and SharedStorage is not None and Chooser is not None:
             self.shared_storage = SharedStorage()
@@ -834,6 +849,24 @@ class RootWidget(BoxLayout):
         Clipboard.copy(self.output_text)
         self._append_output("[info] Output copied to clipboard.\n")
 
+    def copy_success_result(self):
+        """Copy just the last successful Termux result (Install Packages
+        or Run Script output classified as "success"), not the whole
+        mixed log -- see _last_result_content in _start_polling.poll()."""
+        if self._last_result_kind == "success" and self._last_result_content:
+            Clipboard.copy(self._last_result_content)
+            self._append_output("[info] Copied the last successful result to clipboard.\n")
+        else:
+            self._show_message("No successful result to copy yet.")
+
+    def copy_fail_result(self):
+        """Copy just the last failed/error Termux result."""
+        if self._last_result_kind in ("error", "warn") and self._last_result_content:
+            Clipboard.copy(self._last_result_content)
+            self._append_output("[info] Copied the last failed result to clipboard.\n")
+        else:
+            self._show_message("No failed result to copy yet.")
+
     # ---- Human-friendly diagnostics -----------------------------------
     def _friendly_error(self, exc):
         """Translate a raw exception into the short, actionable messages
@@ -897,6 +930,12 @@ class RootWidget(BoxLayout):
                 state["got_output"] = True
                 status_text, kind = self._classify_output(content)
                 self._set_status(status_text, kind)
+                # Track the raw Termux result separately from output_text
+                # (which also has our own [schema]/[run]/etc lines mixed
+                # in) so Copy Success/Fail Result can grab just the
+                # actual result instead of the whole noisy log.
+                self._last_result_content = content
+                self._last_result_kind = kind
                 return
 
             if state["got_output"] or state["hinted"]:
