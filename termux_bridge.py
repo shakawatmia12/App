@@ -202,6 +202,24 @@ def open_termux():
     activity.startActivity(intent)
 
 
+def is_termux_installed():
+    """Check the package is actually present before firing a command at
+    it -- lets us give a clear "Termux isn't installed" message instead
+    of a command that silently goes nowhere."""
+    try:
+        from jnius import autoclass
+    except ImportError:
+        return False
+
+    try:
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+        activity.getPackageManager().getPackageInfo(TERMUX_PACKAGE, 0)
+        return True
+    except Exception:
+        return False
+
+
 def read_log(log_path):
     if not os.path.isfile(log_path):
         return ""

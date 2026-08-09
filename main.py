@@ -654,6 +654,8 @@ class RootWidget(BoxLayout):
         if not self.script_path:
             self._show_message("Select a script first.")
             return
+        if not self._check_termux_ready():
+            return
 
         declared = schema_engine.get_packages(self.schema)
         detected = []
@@ -678,6 +680,8 @@ class RootWidget(BoxLayout):
         if not self.script_path:
             self._show_message("Select a script first.")
             return
+        if not self._check_termux_ready():
+            return
         if not self.save_config():
             return
         self._append_output(f"[run] Launching {self.script_name} in Termux...\n")
@@ -685,6 +689,23 @@ class RootWidget(BoxLayout):
         self._run_bridge_action(lambda: termux_bridge.run_script(self.script_path, log_path=log_path))
         if poll:
             self._start_polling(poll)
+
+    def _check_termux_ready(self):
+        """Verify Termux is actually installed before firing a command at
+        it. Doesn't (can't) verify 'allow-external-apps=true' is set --
+        Termux gives no API for that -- but this rules out one concrete
+        failure mode with a clear message instead of a command that just
+        goes nowhere.
+        """
+        if not ON_ANDROID:
+            return True
+        if termux_bridge.is_termux_installed():
+            return True
+        self._append_output(
+            "[Termux Error] Termux is not installed on this device. Install "
+            "it from F-Droid or GitHub Releases (not Play Store).\n"
+        )
+        return False
 
     def _start_log_poll(self, filename):
         """Publish an (initially empty) log file to shared storage so
@@ -779,14 +800,39 @@ class RootWidget(BoxLayout):
         return f"[Error] {text}"
 
     # ---- Output polling -------------------------------------------------
-    def _start_polling(self, reader):
+    def _start_polling(self, reader, silence_timeout_s=16):
+        """Poll `reader` every 2s for fresh output. If nothing at all comes
+        back within `silence_timeout_s`, surface the most likely reason
+        instead of leaving the user staring at an unchanged screen:
+        Termux almost certainly hasn't accepted the command, which nearly
+        always means 'Setup Termux' was opened but the paste + Enter step
+        inside Termux itself was never actually completed.
+        """
         if self._poll_event:
             self._poll_event.cancel()
+
+        state = {"ticks": 0, "got_output": False, "hinted": False}
+        max_ticks = max(1, silence_timeout_s // 2)
 
         def poll(_dt):
             content = reader()
             if content and content != self.output_text:
                 self.output_text = content
+                state["got_output"] = True
+                return
+
+            if state["got_output"] or state["hinted"]:
+                return
+
+            state["ticks"] += 1
+            if state["ticks"] >= max_ticks:
+                state["hinted"] = True
+                self._append_output(
+                    f"[Termux Error] No response from Termux after {silence_timeout_s}s. "
+                    "This almost always means the command wasn't accepted -- open Termux "
+                    "and confirm you pasted + pressed Enter for the 'Setup Termux' command "
+                    "(tapping the button alone only copies it), then try again.\n"
+                )
 
         self._poll_event = Clock.schedule_interval(poll, 2)
 
