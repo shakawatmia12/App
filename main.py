@@ -631,10 +631,17 @@ class RootWidget(BoxLayout):
             panel.add_widget(self._step_label(f"Waiting: {prompt}"))
 
         if options:
+            # A real menu was detected in the script's own output --
+            # tapping one of these IS the answer, so the generic
+            # manual text box/Send row (and the chips, which only ever
+            # make sense for a free-typed number/proxy value) stay
+            # hidden entirely instead of sitting there unused beneath
+            # the buttons.
             for opt, raw in zip(options, raw_values):
                 btn = Button(text=opt, size_hint_y=None, height=dp(40))
                 btn.bind(on_release=lambda *_a, v=raw: self._submit_answer(v))
                 panel.add_widget(btn)
+            return
 
         answer_input = TextInput(multiline=False, size_hint_y=None, height=dp(40))
 
