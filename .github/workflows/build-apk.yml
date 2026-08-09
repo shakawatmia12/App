@@ -23,6 +23,29 @@ jobs:
         with:
           python-version: '3.11'
 
+      # Every CI run is a fresh VM, so without this, buildozer/gradle
+      # auto-generates a brand new random debug keystore each time --
+      # each APK ends up signed differently, and Android refuses to
+      # install a differently-signed APK "update" over the previous one
+      # ("App not installed"), forcing a manual uninstall every rebuild.
+      # Caching one fixed keystore keeps every build's signature the same
+      # so installing over a previous debug build just works.
+      - name: Restore persistent debug keystore
+        id: keystore-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: debug-keystore-v1
+
+      - name: Generate debug keystore if not cached
+        if: steps.keystore-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.android
+          keytool -genkey -v -keystore ~/.android/debug.keystore \
+            -storepass android -alias androiddebugkey -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
       - name: Cache buildozer global + .buildozer
         uses: actions/cache@v4
         with:
