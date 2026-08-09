@@ -53,8 +53,14 @@ SETUP_COMMAND = (
 )
 
 
-def build_install_command(packages):
-    """Return the shell command that installs python + pip packages."""
+def build_install_command(packages, log_path=None):
+    """Return the shell command that installs python + pip packages.
+
+    `log_path` should be a real path our own app can also read back (see
+    main.py's _prepare_shared_log) -- Termux's plain-filesystem write to
+    the default LOG_DIR works fine for Termux itself, but our own process
+    can't read that path back under Android 10+ scoped storage.
+    """
     pkg_list = " ".join(shlex.quote(p) for p in packages if p)
 
     if pkg_list:
@@ -62,11 +68,12 @@ def build_install_command(packages):
     else:
         body = "echo 'No packages declared in SCHEMA[\"packages\"].'"
 
-    mkdir = f"mkdir -p {shlex.quote(LOG_DIR)}"
-    return f"{mkdir} && ({body}) 2>&1 | tee {shlex.quote(INSTALL_LOG)}"
+    target = log_path or INSTALL_LOG
+    mkdir = f"mkdir -p {shlex.quote(os.path.dirname(target))}"
+    return f"{mkdir} && ({body}) 2>&1 | tee {shlex.quote(target)}"
 
 
-def build_run_command(script_path, extra_args=None):
+def build_run_command(script_path, extra_args=None, log_path=None):
     """Return the shell command that runs the selected script in Termux."""
     if not script_path:
         raise ValueError("script_path is required")
@@ -75,8 +82,9 @@ def build_run_command(script_path, extra_args=None):
     args = " ".join(shlex.quote(str(a)) for a in (extra_args or []))
     body = f"python {quoted_script} {args}".strip()
 
-    mkdir = f"mkdir -p {shlex.quote(LOG_DIR)}"
-    return f"{mkdir} && ({body}) 2>&1 | tee {shlex.quote(RUN_LOG)}"
+    target = log_path or RUN_LOG
+    mkdir = f"mkdir -p {shlex.quote(os.path.dirname(target))}"
+    return f"{mkdir} && ({body}) 2>&1 | tee {shlex.quote(target)}"
 
 
 def _config_filename_for(script_path):
@@ -157,16 +165,16 @@ def send_termux_command(shell_command, session_action="0", background=False):
     ContextCompat.startForegroundService(activity, intent)
 
 
-def install_packages(packages):
+def install_packages(packages, log_path=None):
     """Auto Package Install Action: pkg install python -y && pip install <packages>."""
-    command = build_install_command(packages)
+    command = build_install_command(packages, log_path=log_path)
     send_termux_command(command)
     return command
 
 
-def run_script(script_path, extra_args=None):
+def run_script(script_path, extra_args=None, log_path=None):
     """Run Script Action: python /sdcard/selected_script.py in a Termux session."""
-    command = build_run_command(script_path, extra_args)
+    command = build_run_command(script_path, extra_args, log_path=log_path)
     send_termux_command(command)
     return command
 

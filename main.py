@@ -512,8 +512,10 @@ class RootWidget(BoxLayout):
         self._append_output(
             f"[install] Requesting install of: {', '.join(packages) or '(none declared)'}\n"
         )
-        self._run_bridge_action(lambda: termux_bridge.install_packages(packages))
-        self._start_polling(termux_bridge.read_install_log)
+        log_path, poll = self._start_log_poll("install_output.log")
+        self._run_bridge_action(lambda: termux_bridge.install_packages(packages, log_path=log_path))
+        if poll:
+            self._start_polling(poll)
 
     def run_script(self):
         if not self.script_path:
@@ -521,8 +523,63 @@ class RootWidget(BoxLayout):
             return
         self.save_config()
         self._append_output(f"[run] Launching {self.script_name} in Termux...\n")
-        self._run_bridge_action(lambda: termux_bridge.run_script(self.script_path))
-        self._start_polling(termux_bridge.read_run_log)
+        log_path, poll = self._start_log_poll("run_output.log")
+        self._run_bridge_action(lambda: termux_bridge.run_script(self.script_path, log_path=log_path))
+        if poll:
+            self._start_polling(poll)
+
+    def _start_log_poll(self, filename):
+        """Publish an (initially empty) log file to shared storage so
+        Termux can write into a real path and our own process can still
+        read it back afterward -- see _handle_picked_file's docstring for
+        why a plain shared path can't just be read directly.
+
+        Returns (log_path_for_termux, poll_callable). If shared storage
+        isn't available (non-Android, or the library failed to import),
+        falls back to the old fixed /sdcard/termux_wrapper path and reads
+        it directly -- works fine on pre-scoped-storage Android, silently
+        won't show anything in-app on Android 10+ without it.
+        """
+        if self.shared_storage is None:
+            return None, termux_bridge.read_run_log if "run" in filename else termux_bridge.read_install_log
+
+        try:
+            from jnius import autoclass
+
+            Environment = autoclass("android.os.Environment")
+            cache_dir = self.shared_storage.get_cache_dir()
+            private_path = os.path.join(cache_dir, filename)
+            with open(private_path, "w", encoding="utf-8"):
+                pass
+
+            shared_uri = self.shared_storage.copy_to_shared(
+                private_path, collection=Environment.DIRECTORY_DOCUMENTS
+            )
+            real_path = self._uri_to_real_path(shared_uri) if shared_uri else None
+        except Exception as exc:
+            self._append_output(f"[warn] Live output unavailable ({exc}); check Termux directly.\n")
+            return None, None
+
+        if not real_path:
+            self._append_output("[warn] Live output unavailable (couldn't resolve shared path); check Termux directly.\n")
+            return None, None
+
+        relative_ref = real_path.replace("/storage/emulated/0/", "", 1)
+
+        def poll():
+            try:
+                fresh_copy = self.shared_storage.copy_from_shared(relative_ref)
+            except Exception:
+                return ""
+            if not fresh_copy or not os.path.isfile(fresh_copy):
+                return ""
+            try:
+                with open(fresh_copy, "r", encoding="utf-8", errors="replace") as f:
+                    return f.read()
+            except OSError:
+                return ""
+
+        return real_path, poll
 
     def _run_bridge_action(self, action):
         # Broad except is deliberate: pyjnius/Android calls can raise all
