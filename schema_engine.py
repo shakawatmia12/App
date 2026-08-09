@@ -196,26 +196,52 @@ def detect_imports(script_path):
     return sorted(m for m in modules if m and m not in stdlib)
 
 
-def _extract_prompt_text(call_node):
-    """Best-effort extraction of an input() call's prompt string, so the
-    auto-generated field has a useful label instead of a generic one."""
-    if not call_node.args:
+def _literal_value(node):
+    """ast.literal_eval that returns None instead of raising for anything
+    that isn't a literal (a variable, function call, etc.) -- used
+    throughout the detectors below where a non-literal argument should
+    just be skipped, not crash the whole scan."""
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_string_arg(call_node, index=0):
+    """Best-effort extraction of a call's Nth positional string argument
+    (a prompt, help text, etc.), so an auto-generated field can have a
+    useful label instead of a generic one."""
+    if len(call_node.args) <= index:
         return ""
 
-    arg = call_node.args[0]
-    try:
-        return str(ast.literal_eval(arg)).strip()
-    except (ValueError, TypeError):
-        pass
+    arg = call_node.args[index]
+    value = _literal_value(arg)
+    if isinstance(value, str):
+        return value.strip()
 
     if isinstance(arg, ast.JoinedStr):  # f-string with only literal pieces
         parts = [
-            value.value for value in arg.values
-            if isinstance(value, ast.Constant) and isinstance(value.value, str)
+            part.value for part in arg.values
+            if isinstance(part, ast.Constant) and isinstance(part.value, str)
         ]
         return "".join(parts).strip()
 
     return ""
+
+
+_FILE_HINT_RE = re.compile(r"\.txt\b|\bfile\b", re.IGNORECASE)
+
+
+def _maybe_mark_as_file(field):
+    """Prompt/help text mentioning "file" or a .txt example means the
+    script wants a path to read from, which the user can't usefully
+    hand-type (they don't know Termux's filesystem). Render a Browse
+    button instead of a text box -- see main.py._pick_attachment for how
+    the picked file's content gets transferred to a path Termux can read.
+    """
+    if field["type"] == "text" and _FILE_HINT_RE.search(field["label"]):
+        field["type"] = "file"
+    return field
 
 
 _MENU_LINE_RE = re.compile(r'^\s*(\d+)\s*[.)\-:]\s*(.+?)\s*$')
@@ -300,7 +326,7 @@ def detect_inputs(script_path):
 
     fields = []
     for i, call in enumerate(calls, start=1):
-        prompt = _extract_prompt_text(call)
+        prompt = _extract_string_arg(call)
         field = {
             "key": f"input_{i}",
             "type": "text",
@@ -320,17 +346,237 @@ def detect_inputs(script_path):
             field["options"] = options
             field["default"] = options[0]
             field["_option_values"] = raw_values
-        elif re.search(r"\.txt|\bfile\b", field["label"], re.IGNORECASE):
-            # Prompt text mentions "file" or a .txt example -- the script
-            # almost certainly wants a path to read from, which the user
-            # can't usefully type by hand (they don't know Termux's
-            # filesystem). Render a Browse button instead of a text box;
-            # see main.py._pick_attachment for how the picked file's
-            # content gets transferred to a path Termux can read.
-            field["type"] = "file"
+        else:
+            field = _maybe_mark_as_file(field)
 
         fields.append(field)
     return fields
+
+
+# ---- argparse-based scripts --------------------------------------------
+
+def _find_argparse_parser_names(tree):
+    """Variable names assigned from argparse.ArgumentParser(...) anywhere
+    in the module (covers both `import argparse; argparse.ArgumentParser()`
+    and `from argparse import ArgumentParser; ArgumentParser()`)."""
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            call_func = node.value.func
+            is_parser_call = (
+                (isinstance(call_func, ast.Attribute) and call_func.attr == "ArgumentParser")
+                or (isinstance(call_func, ast.Name) and call_func.id == "ArgumentParser")
+            )
+            if is_parser_call:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+    return names
+
+
+def detect_argparse_fields(script_path):
+    """Scan for parser.add_argument(...) calls on any variable created via
+    argparse.ArgumentParser(), and turn each declared argument into a
+    settings field -- the most common fully-static way Python CLI scripts
+    declare their own inputs, so a script already written with argparse
+    needs zero changes to work here.
+    """
+    try:
+        with open(script_path, "r", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=script_path)
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return []
+
+    parser_names = _find_argparse_parser_names(tree)
+    if not parser_names:
+        return []
+
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in parser_names
+    ]
+    calls.sort(key=lambda n: (n.lineno, n.col_offset))
+
+    fields = []
+    for i, call in enumerate(calls, start=1):
+        flag_names = [
+            arg.value for arg in call.args
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+        ]
+        if not flag_names:
+            continue  # a dynamically-built flag name -- nothing static to read
+
+        kwargs = {}
+        for kw in call.keywords:
+            if kw.arg is None:  # **something -- can't resolve statically
+                continue
+            if kw.arg == "type" and isinstance(kw.value, ast.Name):
+                kwargs["type"] = kw.value.id  # "int" / "float" / "str"
+            else:
+                kwargs[kw.arg] = _literal_value(kw.value)
+
+        primary_flag = max(flag_names, key=len)  # prefer the long form, e.g. --threads
+        is_positional = not primary_flag.startswith("-")
+        key = re.sub(r"[^A-Za-z0-9_]+", "_", primary_flag.lstrip("-")).strip("_") or f"arg_{i}"
+
+        ftype = "text"
+        options = None
+        if kwargs.get("action") in ("store_true", "store_false"):
+            ftype = "boolean"
+        elif isinstance(kwargs.get("choices"), (list, tuple)):
+            ftype = "select"
+            options = [str(c) for c in kwargs["choices"]]
+        elif kwargs.get("type") in ("int", "float"):
+            ftype = "number"
+
+        default = kwargs.get("default")
+        if default is None:
+            default = _type_default(ftype)
+        if ftype == "select" and options and default not in options:
+            default = options[0]
+
+        field = {
+            "key": key,
+            "type": ftype,
+            "label": str(kwargs.get("help") or primary_flag),
+            "default": default,
+            "required": bool(kwargs.get("required", False)),
+            "_argparse_flag": primary_flag,
+            "_argparse_positional": is_positional,
+            "_argparse_is_flag_only": ftype == "boolean",
+        }
+        if options:
+            field["options"] = options
+        if ftype == "text":
+            field = _maybe_mark_as_file(field)
+
+        fields.append(field)
+
+    return fields
+
+
+# ---- sys.argv-based scripts ---------------------------------------------
+
+def detect_sys_argv_fields(script_path):
+    """Scan for sys.argv[N] subscripts and build one positional text field
+    per distinct index referenced (argv[0], the script's own path, is
+    skipped). Covers scripts that read command-line args by hand instead
+    of using argparse.
+    """
+    try:
+        with open(script_path, "r", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=script_path)
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return []
+
+    indexes = set()
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "argv"
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "sys"
+        ):
+            continue
+
+        slice_node = node.slice
+        # Python <3.9 wraps a plain index in ast.Index; unwrap it so
+        # _literal_value sees the actual constant either way.
+        if hasattr(slice_node, "value") and not isinstance(slice_node, (ast.Constant, ast.Slice)):
+            slice_node = slice_node.value
+        idx = _literal_value(slice_node)
+        if isinstance(idx, int) and idx > 0:
+            indexes.add(idx)
+
+    if not indexes:
+        return []
+
+    fields = []
+    for idx in sorted(indexes):
+        field = {
+            "key": f"argv_{idx}",
+            "type": "text",
+            "label": f"Command-line argument #{idx}",
+            "default": "",
+            "required": False,
+            "_argv_index": idx,
+        }
+        fields.append(field)
+    return fields
+
+
+# ---- Unified auto-detection entry point ---------------------------------
+
+def auto_detect_fields(script_path):
+    """Try, in priority order: argparse declarations, sys.argv[N] usage,
+    then input() prompts. Returns (fields, mode) -- mode is "argparse",
+    "argv", "input", or None if the script has no SCHEMA and nothing
+    detectable either.
+
+    The mode tells the caller (main.py) how to feed answers back to the
+    script: argparse/argv fields become command-line arguments (see
+    build_cli_args), input fields get piped in as stdin, in source order.
+    This covers the three common fully-static ways a Python CLI script
+    takes input; a script that pulls its options from somewhere dynamic
+    (an API call, a database, computed at runtime) has nothing static for
+    any tool to read without actually executing it, and gets no fields
+    here rather than an incorrect guess.
+    """
+    fields = detect_argparse_fields(script_path)
+    if fields:
+        return fields, "argparse"
+
+    fields = detect_sys_argv_fields(script_path)
+    if fields:
+        return fields, "argv"
+
+    fields = detect_inputs(script_path)
+    if fields:
+        return fields, "input"
+
+    return [], None
+
+
+def build_cli_args(fields, values):
+    """Build the argv list to pass to the script from argparse/sys.argv
+    -detected fields (see auto_detect_fields) and the user's answers.
+    """
+    positional = {}
+    flags = []
+
+    for field in fields:
+        key = field["key"]
+        value = values.get(key, field.get("default", ""))
+
+        if "_argv_index" in field:
+            positional[field["_argv_index"]] = str(value)
+            continue
+
+        flag = field.get("_argparse_flag")
+        if not flag:
+            continue
+        if field.get("_argparse_is_flag_only"):
+            if value:
+                flags.append(flag)
+        elif field.get("_argparse_positional"):
+            if str(value):
+                flags.append(str(value))
+        elif str(value):
+            flags.append(flag)
+            flags.append(str(value))
+
+    if positional:
+        highest = max(positional)
+        ordered = [positional.get(i, "") for i in range(1, highest + 1)]
+        return ordered + flags
+    return flags
 
 
 # ---- Per-script config helpers (platform-agnostic) ---------------------

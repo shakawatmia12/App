@@ -221,7 +221,7 @@ class RootWidget(BoxLayout):
         self.field_widgets = {}
         self._poll_event = None
         self._readable_script_path = ""
-        self._auto_input_fields = False
+        self._auto_field_mode = None  # None, "argparse", "argv", or "input"
         self._script_running = False
         self._pending_attachment_key = None
         self._attached_files = {}
@@ -460,7 +460,7 @@ class RootWidget(BoxLayout):
         self.script_path = readable_path
         self.script_name = display_name
         self._readable_script_path = readable_path
-        self._auto_input_fields = False
+        self._auto_field_mode = None
         self._attached_files = {}
         self._attachment_labels = {}
         self._script_running = False
@@ -468,17 +468,18 @@ class RootWidget(BoxLayout):
 
         fields = schema_engine.get_fields(self.schema)
         if not fields:
-            # No SCHEMA fields declared -- fall back to auto-detecting the
-            # script's own input() calls (same spirit as package
-            # auto-detection from imports) and building a form from those,
-            # instead of leaving the user with nothing to configure and a
-            # script that will hang forever waiting for typed input it can
-            # never receive under Termux's headless RUN_COMMAND.
-            detected_inputs = schema_engine.detect_inputs(readable_path)
-            if detected_inputs:
-                self.schema["fields"] = detected_inputs
-                self._auto_input_fields = True
-                fields = detected_inputs
+            # No SCHEMA fields declared -- fall back to auto-detecting how
+            # the script itself takes input (argparse, sys.argv, or plain
+            # input() prompts -- see schema_engine.auto_detect_fields) and
+            # building a form from that, instead of leaving the user with
+            # nothing to configure and a script that will hang forever
+            # waiting for typed input it can never receive under Termux's
+            # headless RUN_COMMAND.
+            detected_fields, mode = schema_engine.auto_detect_fields(readable_path)
+            if detected_fields:
+                self.schema["fields"] = detected_fields
+                self._auto_field_mode = mode
+                fields = detected_fields
 
         saved_values = self._load_saved_config()
         self._build_form(saved_values)
@@ -486,19 +487,28 @@ class RootWidget(BoxLayout):
         self._append_output(f"[schema] Loaded '{self.schema.get('name')}' "
                              f"({len(fields)} fields, "
                              f"{len(schema_engine.get_packages(self.schema))} packages)\n")
-        if self._auto_input_fields:
+        if self._auto_field_mode:
+            source_desc = {
+                "argparse": "argparse argument(s)",
+                "argv": "sys.argv positional argument(s)",
+                "input": "input() prompt(s)",
+            }[self._auto_field_mode]
+            feed_desc = (
+                "as command-line arguments" if self._auto_field_mode in ("argparse", "argv")
+                else "to the script's input() calls, in the same order they appear in its code"
+            )
             self._append_output(
-                f"[schema] No SCHEMA found, but auto-detected {len(fields)} input() "
-                "prompt(s) in this script. Fill them in below -- Run Script will feed "
-                "your answers to the script in the same order they appear in its code. "
-                "This is a best-effort guess: if the script's questions change "
-                "depending on an earlier menu choice, these fields may not match "
-                "exactly what actually gets asked.\n"
+                f"[schema] No SCHEMA found, but auto-detected {len(fields)} {source_desc} "
+                f"in this script. Fill them in below -- Run Script will feed your answers "
+                f"back {feed_desc}. This is a best-effort static scan, not a real "
+                "interpreter: a script whose options depend on runtime logic (an earlier "
+                "menu choice, a value computed at runtime) may not match exactly.\n"
             )
         elif not fields:
-            # Truly nothing to go on: no SCHEMA and no input() calls found
-            # either. Say so explicitly instead of leaving the user to
-            # guess why "No configurable options" is showing.
+            # Truly nothing to go on: no SCHEMA and no argparse/sys.argv/
+            # input() usage found either. Say so explicitly instead of
+            # leaving the user to guess why "No configurable options" is
+            # showing.
             self._append_output(
                 f"[schema] {self.schema.get('description', '')} "
                 "To add configurable settings, put a SCHEMA dict with a "
@@ -759,44 +769,59 @@ class RootWidget(BoxLayout):
         filename = os.path.basename(self._readable_script_path)
 
         stdin_values = None
-        attachments = None
-        if self._auto_input_fields:
-            # Feed the form's answers to the script's own input() calls, in
-            # the same source order schema_engine.detect_inputs found them.
+        extra_args = None
+        attachments = {}
+
+        if self._auto_field_mode:
+            fields = schema_engine.get_fields(self.schema)
             values = self._collect_form_values()
-            stdin_values = []
-            attachments = {}
-            for f in schema_engine.get_fields(self.schema):
-                key = f["key"]
+
+            # "file" fields are transferred as attachments regardless of
+            # mode (argparse/argv/input); the answer fed back becomes the
+            # Termux path the content actually landed at.
+            for f in fields:
                 if f["type"] == "file":
+                    key = f["key"]
                     attached = self._attached_files.get(key)
                     if attached:
                         termux_path = f"{termux_bridge.ATTACHMENTS_DIR}/{attached['filename']}"
                         attachments[termux_path] = attached["content"]
-                        stdin_values.append(termux_path)
+                        values[key] = termux_path
                     else:
-                        stdin_values.append("")
-                    continue
+                        values[key] = ""
 
-                val = values.get(key, "")
-                # Auto-detected dropdowns display "N) description" but the
-                # script itself only ever typed a bare number/letter into
-                # its input() -- translate back to that raw value here.
-                option_values = f.get("_option_values")
-                options = f.get("options")
-                if option_values and options and val in options:
-                    val = option_values[options.index(val)]
-                stdin_values.append(str(val))
-            attachments = attachments or None
-            self._append_output(
-                f"[run] Feeding {len(stdin_values)} answer(s) to the script's input() calls...\n"
-            )
+            if self._auto_field_mode == "input":
+                # Feed answers to the script's own input() calls, in the
+                # same source order schema_engine.detect_inputs found them.
+                stdin_values = []
+                for f in fields:
+                    val = values.get(f["key"], "")
+                    # Auto-detected dropdowns display "N) description" but
+                    # the script itself only ever typed a bare number into
+                    # its input() -- translate back to that raw value.
+                    option_values = f.get("_option_values")
+                    options = f.get("options")
+                    if option_values and options and val in options:
+                        val = option_values[options.index(val)]
+                    stdin_values.append(str(val))
+                self._append_output(
+                    f"[run] Feeding {len(stdin_values)} answer(s) to the script's input() calls...\n"
+                )
+            else:
+                # argparse / sys.argv -- build the actual argv list.
+                extra_args = schema_engine.build_cli_args(fields, values)
+                self._append_output(
+                    f"[run] Launching with arguments: {' '.join(extra_args) or '(none)'}\n"
+                )
+
+        attachments = attachments or None
 
         self._append_output(f"[run] Launching {self.script_name} in Termux...\n")
         self._set_status("Sending Run Script command to Termux...", "info")
         if not self._run_bridge_action(
             lambda: termux_bridge.run_script_from_content(
-                content, filename, stdin_values=stdin_values, attachments=attachments
+                content, filename, extra_args=extra_args,
+                stdin_values=stdin_values, attachments=attachments,
             )
         ):
             return
