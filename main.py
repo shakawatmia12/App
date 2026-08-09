@@ -323,19 +323,80 @@ class RootWidget(BoxLayout):
             from jnius import autoclass
 
             Environment = autoclass("android.os.Environment")
-            shared_ref = self.shared_storage.copy_to_shared(
+            shared_uri = self.shared_storage.copy_to_shared(
                 private_path, collection=Environment.DIRECTORY_DOCUMENTS
             )
         except Exception as exc:
             self._append_output(f"[error] Could not publish script for Termux: {exc}\n")
             return
-        if not shared_ref:
+        if not shared_uri:
             self._append_output("[error] Could not publish script for Termux (no reference returned).\n")
             return
 
-        run_path = f"/storage/emulated/0/{shared_ref}"
+        run_path = self._uri_to_real_path(shared_uri)
+        if not run_path:
+            self._append_output(
+                f"[error] Published the script but couldn't resolve its real path "
+                f"(got: {shared_uri!r}). Termux can't run a content:// reference directly.\n"
+            )
+            return
+
         self._apply_loaded_script(schema, run_path, filename)
         self._append_output(f"[schema] Termux will run: {run_path}\n")
+
+    def _uri_to_real_path(self, uri):
+        """Resolve a MediaStore content Uri (returned by copy_to_shared) to
+        a real absolute filesystem path Termux can open directly.
+
+        copy_to_shared() returns an android.net.Uri object, not a path
+        string as some library examples implied -- confirmed on a real
+        device (str(uri) showed the Java object repr). MediaStore's "_data"
+        column still holds a real path for local primary-storage files on
+        most devices; RELATIVE_PATH + DISPLAY_NAME is the fallback for
+        devices where "_data" comes back empty.
+        """
+        try:
+            from jnius import autoclass
+        except ImportError:
+            return None
+
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        resolver = PythonActivity.mActivity.getContentResolver()
+
+        def query_columns(columns):
+            try:
+                cursor = resolver.query(uri, columns, None, None, None)
+            except Exception:
+                # jnius doesn't always auto-convert a python list to the
+                # Java String[] this overload expects -- build one by hand.
+                try:
+                    cursor = resolver.query(uri, termux_bridge._to_java_string_array(columns), None, None, None)
+                except Exception:
+                    return {}
+            if cursor is None:
+                return {}
+            try:
+                if not cursor.moveToFirst():
+                    return {}
+                result = {}
+                for col in columns:
+                    idx = cursor.getColumnIndex(col)
+                    if idx >= 0:
+                        result[col] = cursor.getString(idx)
+                return result
+            finally:
+                cursor.close()
+
+        row = query_columns(["_data"])
+        if row.get("_data"):
+            return row["_data"]
+
+        row = query_columns(["_display_name", "relative_path"])
+        if row.get("_display_name"):
+            rel = row.get("relative_path") or ""
+            return f"/storage/emulated/0/{rel}{row['_display_name']}"
+
+        return None
 
     def load_manual_path(self, path):
         path = path.strip()
