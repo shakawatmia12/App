@@ -39,7 +39,7 @@ fullscreen = 0
 # com.termux.permission.RUN_COMMAND: required by Termux to accept our
 # RUN_COMMAND intent (Termux declares this as a signature/normal permission
 # depending on version; requesting it here is required either way).
-android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,MANAGE_EXTERNAL_STORAGE,com.termux.permission.RUN_COMMAND
+android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,MANAGE_EXTERNAL_STORAGE,com.termux.permission.RUN_COMMAND,INTERNET
 
 # Reverted: lowering android.api to 28 to dodge scoped storage also drags
 # compileSdkVersion down with it in this p4a version (they're the same

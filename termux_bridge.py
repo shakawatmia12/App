@@ -69,6 +69,21 @@ RUN_PID_FILE = f"{SCRIPTS_DIR}/_last_run.pid"
 # side.
 RUNTIME_DIR = f"{TERMUX_HOME}/.script_wrapper_run"
 
+# Primary IPC channel: a plain loopback TCP socket main.py listens on.
+# Two apps on the same Android device share the same network namespace,
+# so a socket bound to 127.0.0.1 by our app is reachable from Termux's
+# process exactly like any other loopback client/server pair -- this
+# sidesteps the whole FIFO-on-a-real-filesystem question entirely, since
+# a TCP connection has no dependency on what filesystem anything lives
+# on. A blocking recv() on a connected socket only ever returns empty
+# when the peer actually closes the connection, never spuriously the way
+# a FIFO backed by an unsuitable filesystem could -- see the wrapper
+# script built by _build_wrapper_source below for how a script's actual
+# input()/print() calls are routed through it, with the RUNTIME_DIR FIFO
+# kept as an automatic fallback if the socket can't be reached.
+SOCKET_HOST = "127.0.0.1"
+SOCKET_PORT = 9988
+
 # Printed once a script's process has actually exited, so polling the log
 # can tell "finished" apart from "just quiet for a moment" -- see
 # build_interactive_run_command.
@@ -102,9 +117,9 @@ def build_install_command(packages, log_path=None):
 
 
 def _run_paths(filename):
-    """Per-script paths for the FIFO/answers-queue/feeder-pid trio used by
-    an interactive run -- named after the script so two different scripts
-    picked one after another don't collide on a leftover FIFO."""
+    """Per-script paths for the FIFO/answers-queue/feeder-pid/wrapper
+    quartet used by an interactive run -- named after the script so two
+    different scripts picked one after another don't collide."""
     import schema_engine
 
     stem = schema_engine.sanitize_name(filename)
@@ -112,45 +127,189 @@ def _run_paths(filename):
         "fifo": f"{RUNTIME_DIR}/_run_{stem}.fifo",
         "answers": f"{RUNTIME_DIR}/_run_{stem}_answers.txt",
         "feed_pid": f"{RUNTIME_DIR}/_run_{stem}_feed.pid",
+        "wrapper": f"{RUNTIME_DIR}/_run_{stem}_wrapper.py",
     }
+
+
+# The actual script never runs directly -- it's exec'd (via runpy) from
+# inside this small wrapper, which monkey-patches input()/stdout first.
+# That's what makes the "never hand the script a blank/EOF answer"
+# guarantee (layer 3) independent of which transport ends up being used:
+# _read_answer_line() below refuses to return anything for an empty
+# read, on either the socket or the FIFO fallback, and just keeps
+# waiting instead -- a human never submits a genuinely blank answer, so
+# an empty read only ever means "the channel isn't ready yet", not a
+# real answer.
+#
+# Placeholders (__TOKEN__) are substituted with repr()'d Python literals
+# by _build_wrapper_source, never raw string interpolation -- so a path
+# or argument containing a quote/backslash can't corrupt the generated
+# source.
+_WRAPPER_SOURCE_TEMPLATE = r'''
+import sys
+import socket
+import builtins
+import time
+import runpy
+
+SCRIPT_PATH = __SCRIPT_PATH_REPR__
+ARGS = __ARGS_REPR__
+HOST = __HOST_REPR__
+PORT = __PORT__
+FALLBACK_FIFO = __FALLBACK_FIFO_REPR__
+
+sys.argv = [SCRIPT_PATH] + list(ARGS)
+
+_channel = ("none", None)
+
+
+def _connect():
+    global _channel
+    try:
+        sock = socket.create_connection((HOST, PORT), timeout=5)
+        _channel = ("socket", sock.makefile("rw", encoding="utf-8", newline="\n"))
+        return
+    except OSError:
+        pass
+    try:
+        _channel = ("fifo", open(FALLBACK_FIFO, "r", encoding="utf-8"))
+    except OSError:
+        _channel = ("none", None)
+
+
+_connect()
+
+
+def _read_answer_line():
+    kind, chan = _channel
+    if chan is None:
+        while True:
+            time.sleep(1)
+    while True:
+        try:
+            line = chan.readline()
+        except OSError:
+            time.sleep(0.2)
+            continue
+        if line == "":
+            # Never trust a single empty read as a real answer -- a
+            # human never submits nothing, so treat it as "not ready
+            # yet" and keep waiting instead of handing the caller "".
+            time.sleep(0.1)
+            continue
+        return line.rstrip("\n")
+
+
+def _bridged_input(prompt=""):
+    if prompt:
+        sys.__stdout__.write(str(prompt))
+        sys.__stdout__.flush()
+    if _channel[0] == "socket":
+        try:
+            _channel[1].write("PROMPT:" + str(prompt).replace("\n", " ") + "\n")
+            _channel[1].flush()
+        except OSError:
+            pass
+    return _read_answer_line()
+
+
+builtins.input = _bridged_input
+
+
+class _BridgedStdout:
+    def __init__(self, real):
+        self._real = real
+
+    def write(self, text):
+        self._real.write(text)
+        if text and _channel[0] == "socket":
+            try:
+                _channel[1].write("OUT:" + text.replace("\n", "\x02") + "\n")
+                _channel[1].flush()
+            except OSError:
+                pass
+
+    def flush(self):
+        self._real.flush()
+
+    def isatty(self):
+        return False
+
+
+sys.stdout = _BridgedStdout(sys.stdout)
+
+try:
+    runpy.run_path(SCRIPT_PATH, run_name="__main__")
+finally:
+    if _channel[0] == "socket":
+        try:
+            _channel[1].write("DONE:\n")
+            _channel[1].flush()
+        except OSError:
+            pass
+'''
+
+
+def _build_wrapper_source(script_path, fallback_fifo, extra_args=None):
+    src = _WRAPPER_SOURCE_TEMPLATE
+    src = src.replace("__SCRIPT_PATH_REPR__", repr(script_path))
+    src = src.replace("__ARGS_REPR__", repr(list(extra_args or [])))
+    src = src.replace("__HOST_REPR__", repr(SOCKET_HOST))
+    src = src.replace("__PORT__", str(SOCKET_PORT))
+    src = src.replace("__FALLBACK_FIFO_REPR__", repr(fallback_fifo))
+    return src
 
 
 def build_interactive_run_command(content, filename, extra_args=None, preset_answers=None,
                                    attachments=None, log_path=None):
-    """Run `content` inside Termux with its stdin wired to a named pipe
-    (FIFO) instead of a plain file, so answers can be fed to it ONE AT A
-    TIME while it's actually running, in response to what it actually
-    prints -- not pre-computed once, up front, from a static guess about
-    what it will ask.
+    """Run `content` inside Termux via a small wrapper (see
+    _build_wrapper_source) that monkey-patches input()/stdout before
+    exec'ing it, so answers can be fed to it ONE AT A TIME while it's
+    actually running, in response to what it actually prints -- not
+    pre-computed once, up front, from a static guess about what it will
+    ask.
 
-    Why a FIFO plus a separate relay ("feeder") process, instead of just
-    repeatedly doing `echo answer > fifo` from each new RUN_COMMAND: a
-    FIFO delivers EOF to its reader the instant its write end has NO open
-    writers left, even for a moment -- so a sequence of independent
-    short-lived `> fifo` writers (open, write one line, close) would hand
-    the script an EOFError the moment the FIRST one closes, well before a
-    second answer ever arrives. The feeder keeps the FIFO's write end
-    open for the script's *entire* run by holding it open itself
-    (`exec 3>fifo`) and relaying lines appended to a plain "answers" file
-    into it via `tail -f`; appending to a plain file from any later,
-    independent RUN_COMMAND has no such EOF hazard.
+    The wrapper's own primary channel is a loopback TCP socket main.py
+    listens on (see SOCKET_HOST/SOCKET_PORT) -- a connected socket has no
+    dependency on any filesystem's quirks, so a blocking read on it only
+    ever returns empty when the peer truly closes it. If that connection
+    can't be made (app not running, port unreachable, anything), the
+    wrapper falls back to opening a FIFO directly itself.
+
+    That FIFO still needs a separate relay ("feeder") process holding its
+    write end open, for the same reason as before: a FIFO delivers EOF to
+    its reader the instant its write end has NO open writers left, even
+    for a moment -- so a sequence of independent short-lived `> fifo`
+    writers (open, write one line, close) would hand the script an
+    EOFError the moment the FIRST one closes, well before a second answer
+    ever arrives. The feeder keeps the FIFO's write end open for the
+    script's *entire* run by holding it open itself (`exec 3>fifo`) and
+    relaying lines appended to a plain "answers" file into it via
+    `tail -f`; appending to a plain file from any later, independent
+    RUN_COMMAND has no such EOF hazard.
 
     preset_answers: an optional list of answers known up front (loaded
     from a saved preset -- see build_save_preset_command) is pre-written
-    into the answers file before the script starts, so it runs hands-free
-    through however many of its prompts the preset covers, and only ever
-    falls back to waiting for a live answer (send_answer()) once/if it
-    asks for more than the preset provided.
+    into the answers file for the FIFO-fallback case (main.py separately
+    auto-answers from the same preset over the socket when that's the
+    active channel), so a run goes hands-free through however many of
+    its prompts the preset covers, and only ever falls back to waiting
+    for a live answer once/if it asks for more than the preset provided.
     """
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     script_path = f"{SCRIPTS_DIR}/{filename}"
     target = log_path or RUN_LOG
-    args = " ".join(shlex.quote(str(a)) for a in (extra_args or []))
     paths = _run_paths(filename)
-    fifo, answers, feed_pid = paths["fifo"], paths["answers"], paths["feed_pid"]
+    fifo, answers, feed_pid, wrapper_path = (
+        paths["fifo"], paths["answers"], paths["feed_pid"], paths["wrapper"]
+    )
 
     mkdir_dirs = {SCRIPTS_DIR, os.path.dirname(target), RUNTIME_DIR}
     write_parts = [f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(script_path)}"]
+
+    wrapper_source = _build_wrapper_source(script_path, fifo, extra_args)
+    encoded_wrapper = base64.b64encode(wrapper_source.encode("utf-8")).decode("ascii")
+    write_parts.append(f"echo {shlex.quote(encoded_wrapper)} | base64 -d > {shlex.quote(wrapper_path)}")
 
     if attachments:
         for path, text in attachments.items():
@@ -212,9 +371,12 @@ def build_interactive_run_command(content, filename, extra_args=None, preset_ans
     # -u / PYTHONUNBUFFERED: CPython block-buffers stdout once it isn't a
     # real TTY (true here regardless, since everything goes through
     # `tee`), so prompts can sit invisible for a long time without this.
-    run_inner = (
-        f"PYTHONUNBUFFERED=1 python -u {shlex.quote(script_path)} {args} < {shlex.quote(fifo)}"
-    ).strip()
+    # Runs the WRAPPER, not the raw script directly -- no `< fifo`
+    # redirect on this process's own stdin at all anymore, since the
+    # wrapper acquires its answers explicitly (socket or an open() on
+    # the FIFO path itself), completely decoupled from whatever this
+    # shell happens to hand it as fd 0.
+    run_inner = f"PYTHONUNBUFFERED=1 python -u {shlex.quote(wrapper_path)}"
     run = f"{run_inner} & echo $! > {shlex.quote(RUN_PID_FILE)}; wait $(cat {shlex.quote(RUN_PID_FILE)})"
     cleanup = f"kill $(cat {shlex.quote(feed_pid)}) 2>/dev/null; rm -f {shlex.quote(fifo)}"
 

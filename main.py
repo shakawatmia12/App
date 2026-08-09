@@ -1,5 +1,7 @@
 """Termux Script Management Wrapper - GUI Dashboard & Terminal Console UI."""
 import os
+import socket
+import threading
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -256,6 +258,21 @@ class RootWidget(BoxLayout):
         self._quiet_ticks = 0
         self._awaiting_input = False
         self._collected_answers = []
+        # Preset answers still waiting to be auto-fed once the socket
+        # channel confirms a prompt actually happened (see
+        # _on_socket_prompt) -- the FIFO-fallback path pre-seeds the
+        # same values a different way (preset_answers in
+        # run_script_interactive), so this queue is only consulted when
+        # a live socket connection is what's actually driving the run.
+        self._preset_queue = []
+        # Live IPC (primary channel -- see termux_bridge's wrapper
+        # script and module docstring): a connected client's write-file
+        # object, guarded by a lock since the accept/read loop runs on a
+        # background thread while answers get sent from the main
+        # (Kivy/UI) thread.
+        self._socket_conn = None
+        self._socket_active = False
+        self._socket_lock = threading.Lock()
 
         if ON_ANDROID and SharedStorage is not None and Chooser is not None:
             self.shared_storage = SharedStorage()
@@ -263,6 +280,124 @@ class RootWidget(BoxLayout):
         else:
             self.shared_storage = None
             self.chooser = None
+
+        self._start_socket_server()
+
+    # ---- Live socket IPC (primary interactive channel) -------------------
+    def _start_socket_server(self):
+        """Listen on 127.0.0.1 for the wrapper script Termux runs (see
+        termux_bridge._build_wrapper_source) to connect to. Two apps on
+        the same Android device share one network namespace, so a
+        loopback socket is reachable across the app boundary exactly
+        like any other client/server pair -- no dependency on which
+        filesystem anything lives on, unlike a FIFO. Runs for the whole
+        app lifetime; each script run is just a fresh connection accepted
+        in turn, since only one script runs at a time.
+
+        Failing to bind (port in use, sockets unavailable for some
+        reason) is non-fatal -- the wrapper's own fallback to a FIFO
+        under Termux's home directory still works without this, just
+        without instant prompt notifications (falls back to the
+        polling/quiet-detection heuristic instead).
+        """
+        try:
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((termux_bridge.SOCKET_HOST, termux_bridge.SOCKET_PORT))
+            server.listen(1)
+        except OSError as exc:
+            self._socket_server = None
+            Clock.schedule_once(lambda dt: self._append_output(
+                f"[Debug] Local socket server unavailable ({exc}) -- "
+                "interactive runs will use the FIFO fallback only.\n"
+            ))
+            return
+        self._socket_server = server
+        threading.Thread(target=self._socket_accept_loop, daemon=True).start()
+
+    def _socket_accept_loop(self):
+        while True:
+            try:
+                conn, _addr = self._socket_server.accept()
+            except OSError:
+                return
+            rfile = conn.makefile("r", encoding="utf-8", newline="\n")
+            wfile = conn.makefile("w", encoding="utf-8", newline="\n")
+            with self._socket_lock:
+                self._socket_conn = wfile
+            self._socket_read_loop(rfile)
+            with self._socket_lock:
+                if self._socket_conn is wfile:
+                    self._socket_conn = None
+
+    def _socket_read_loop(self, rfile):
+        """Runs on the background accept thread for the life of one
+        connection -- every UI-facing action it triggers is marshalled
+        onto the main thread via Clock.schedule_once, since Kivy widgets/
+        properties are not thread-safe to touch directly."""
+        while True:
+            try:
+                line = rfile.readline()
+            except OSError:
+                return
+            if line == "":
+                return
+            line = line.rstrip("\n")
+            if line.startswith("PROMPT:"):
+                text = line[len("PROMPT:"):]
+                Clock.schedule_once(lambda dt, t=text: self._on_socket_prompt(t))
+            elif line.startswith("OUT:"):
+                text = line[len("OUT:"):].replace("\x02", "\n")
+                Clock.schedule_once(lambda dt, t=text: self._on_socket_output(t))
+            elif line.startswith("DONE:"):
+                Clock.schedule_once(lambda dt: self._on_socket_done())
+
+    def _on_socket_output(self, text):
+        """A print() from the running script, forwarded live -- same
+        text the tee'd log file will also end up with, so this is purely
+        a faster/more direct path to the same content; _start_polling's
+        poll() skips its own append once self._socket_active is set, to
+        avoid showing everything twice."""
+        if not self._script_running:
+            return
+        self._socket_active = True
+        clean = schema_engine.strip_ansi(text)
+        self._append_output(clean if clean.endswith("\n") else clean + "\n")
+        self._pending_chunk += text
+
+    def _on_socket_prompt(self, prompt_text):
+        """The wrapper's input() call has actually been reached -- this
+        is an exact signal, not a guess from silence, so the step UI (or
+        a preset auto-answer) fires immediately instead of waiting out
+        the quiet-tick timer."""
+        if not self._script_running:
+            return
+        self._socket_active = True
+        if self._preset_queue:
+            value = self._preset_queue.pop(0)
+            self._append_output(f"[preset] Auto-answering: {value!r}\n")
+            self._submit_answer(value)
+            return
+        chunk = self._pending_chunk if self._pending_chunk.strip() else prompt_text
+        self._show_step_ui(chunk)
+
+    def _on_socket_done(self):
+        self._finish_run()
+
+    def _send_via_socket(self, value):
+        with self._socket_lock:
+            wfile = self._socket_conn
+        if wfile is None:
+            return False
+        try:
+            wfile.write(value + "\n")
+            wfile.flush()
+            return True
+        except OSError:
+            with self._socket_lock:
+                if self._socket_conn is wfile:
+                    self._socket_conn = None
+            return False
 
     # ---- One-time Termux setup -------------------------------------------
     def setup_termux(self):
@@ -603,6 +738,13 @@ class RootWidget(BoxLayout):
         self._shown_chunk_len = 0
         self._quiet_ticks = 0
         self._awaiting_input = False
+        self._socket_active = False
+        # Consumed by _on_socket_prompt as each PROMPT: notification
+        # arrives over the socket -- the FIFO-fallback path instead gets
+        # the same values pre-seeded into the answers file up front (see
+        # preset_answers below), since it has no way to be told "a
+        # prompt just happened" and has to fall back to quiet-detection.
+        self._preset_queue = list(preset_answers or [])
         self._clear_step_panel()
 
         self._append_output(f"[run] Launching {self.script_name} in Termux...\n")
@@ -723,7 +865,14 @@ class RootWidget(BoxLayout):
         # so a report of "the script rejected my answer" carries actual
         # evidence of exactly what was sent.
         self._append_output(f"[you] {value!r}\n")
-        self._run_bridge_action(lambda: termux_bridge.send_answer(self._current_filename, value))
+        # Primary channel: write straight to the connected wrapper's
+        # socket if one is live for this run -- effectively instant, no
+        # RUN_COMMAND round-trip needed. Only falls back to the
+        # FIFO-relay RUN_COMMAND path (send_answer) when no socket
+        # connection exists (the wrapper's own connect() failed and it
+        # dropped to its FIFO fallback instead).
+        if not self._send_via_socket(value):
+            self._run_bridge_action(lambda: termux_bridge.send_answer(self._current_filename, value))
         self._awaiting_input = False
         # Keep anything that arrived AFTER the snapshot the current step
         # UI was built from (see _show_step_ui) instead of discarding the
@@ -859,20 +1008,6 @@ class RootWidget(BoxLayout):
         state = {"ticks": 0, "got_output": False, "hinted": False, "last_content": ""}
         max_ticks = max(1, silence_timeout_s // 2)
 
-        def finish_run():
-            self._script_running = False
-            self.run_button_text = "Run Script"
-            self._awaiting_input = False
-            self._show_finished_notice("Script Finished")
-            if self._poll_event:
-                self._poll_event.cancel()
-            note = (
-                f" {len(self._collected_answers)} answer(s) were given this run -- "
-                "tap Save Config to store them as a reusable preset."
-                if self._collected_answers else ""
-            )
-            self._append_output(f"[run] Script process has exited.{note}\n")
-
         def poll(_dt):
             content = reader()
             if content and content != state["last_content"]:
@@ -889,7 +1024,11 @@ class RootWidget(BoxLayout):
 
                 done = interactive and termux_bridge.DONE_MARKER in new_part
                 visible_part = new_part.replace(termux_bridge.DONE_MARKER, "") if done else new_part
-                if visible_part.strip():
+                # Once the socket channel is confirmed live for this run,
+                # _on_socket_output already appends every print() live --
+                # appending the same text again here from the tee'd log
+                # diff would just show everything twice.
+                if visible_part.strip() and not self._socket_active:
                     # The terminal box should show the same text a human
                     # would see in a real terminal, not raw escape bytes
                     # like "\x1b[1;92m" -- parse_menu_options/
@@ -913,7 +1052,7 @@ class RootWidget(BoxLayout):
                 self._last_result_kind = kind
 
                 if done:
-                    finish_run()
+                    self._finish_run()
                 return
 
             if not interactive:
@@ -936,14 +1075,38 @@ class RootWidget(BoxLayout):
             # Interactive mode: no new output this tick. Once it's been
             # quiet for a couple of ticks (~4s) and there's something
             # pending from before, treat that as the script blocking on
-            # its next prompt and show buttons/an answer box for it.
-            if self._awaiting_input:
+            # its next prompt and show buttons/an answer box for it. Not
+            # consulted once the socket channel is live -- there,
+            # _on_socket_prompt gets an exact signal instead of a guess.
+            if self._awaiting_input or self._socket_active:
                 return
             self._quiet_ticks += 1
             if self._quiet_ticks == 2 and self._pending_chunk.strip():
                 self._show_step_ui(self._pending_chunk)
 
         self._poll_event = Clock.schedule_interval(poll, 2)
+
+    def _finish_run(self):
+        """Shared by both completion signals: termux_bridge.DONE_MARKER
+        showing up in the polled log, and a "DONE:" message over the live
+        socket (see _on_socket_done) -- whichever arrives first. Guarded
+        so a second signal arriving shortly after the first is a no-op
+        instead of double-logging/resetting state that's already reset.
+        """
+        if not self._script_running:
+            return
+        self._script_running = False
+        self.run_button_text = "Run Script"
+        self._awaiting_input = False
+        self._show_finished_notice("Script Finished")
+        if self._poll_event:
+            self._poll_event.cancel()
+        note = (
+            f" {len(self._collected_answers)} answer(s) were given this run -- "
+            "tap Save Config to store them as a reusable preset."
+            if self._collected_answers else ""
+        )
+        self._append_output(f"[run] Script process has exited.{note}\n")
 
     def _classify_output(self, content):
         """Cheap heuristic to turn raw tee'd output into a short status
