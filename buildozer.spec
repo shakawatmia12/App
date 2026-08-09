@@ -38,7 +38,15 @@ fullscreen = 0
 # depending on version; requesting it here is required either way).
 android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,MANAGE_EXTERNAL_STORAGE,com.termux.permission.RUN_COMMAND
 
-android.api = 33
+# android.api is targetSdkVersion. We deliberately keep it at 28 (below
+# Android 10's scoped-storage threshold of 29): a confirmed test showed
+# that even *reading* a plain path like /storage/emulated/0/Download/x.py
+# raises PermissionError on Android 10 once targetSdkVersion >= 29, no
+# matter that the legacy Storage permission is granted. Apps targeting
+# API < 29 are exempt from scoped storage entirely, on every Android
+# version released so far. This does NOT affect compileSdkVersion, which
+# p4a's Gradle template pins independently for toolchain compatibility.
+android.api = 28
 android.minapi = 24
 android.ndk = 25b
 # Single arch keeps the first CI build faster/less failure-prone.
