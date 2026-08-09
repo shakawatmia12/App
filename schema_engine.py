@@ -14,6 +14,22 @@ import sys
 
 SUPPORTED_FIELD_TYPES = {"number", "text", "boolean", "select"}
 
+# Matches both forms an ANSI colour escape can take in a .py file: the
+# literal backslash-digit source text (\033[1;92m, \x1b[1;92m) as it
+# appears before Python ever evaluates the string literal, and the real
+# ESC control byte in case a file already contains raw bytes.
+_ANSI_SOURCE_RE = re.compile(r"\\033\[[0-9;]*m|\\x1b\[[0-9;]*m|\x1b\[[0-9;]*m", re.IGNORECASE)
+
+
+def _read_source_clean(script_path):
+    """Read a script and strip ANSI colour escapes immediately, before
+    anything else touches it, so every detector below -- and the AST it
+    parses -- only ever sees the plain text a colourised menu actually
+    presents to the user, never raw escape bytes."""
+    with open(script_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    return _ANSI_SOURCE_RE.sub("", source)
+
 
 class SchemaError(Exception):
     """Raised when a target script's SCHEMA cannot be read or is invalid."""
@@ -177,8 +193,7 @@ def detect_imports(script_path):
     without requiring every script to hand-list them in SCHEMA.
     """
     try:
-        with open(script_path, "r", encoding="utf-8") as f:
-            source = f.read()
+        source = _read_source_clean(script_path)
         tree = ast.parse(source, filename=script_path)
     except (OSError, UnicodeDecodeError, SyntaxError):
         return []
@@ -207,26 +222,50 @@ def _literal_value(node):
         return None
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _strip_ansi(text):
+    """Strip ANSI escape/colour codes (e.g. "\\033[1;92m" ... "\\033[0m",
+    however many parameters or final letter they use) so a script that
+    colourizes its menus doesn't hide the actual option text from the
+    detectors below or leak escape bytes into the UI."""
+    return _ANSI_RE.sub("", text) if text else text
+
+
+def _extract_string_arg_node(node, strict=False):
+    """Resolve a single AST node to its string value, or None if it can't
+    be resolved statically. In `strict` mode (used when the exact text
+    matters, e.g. reading a menu option's number/label), an f-string with
+    any `{expr}` placeholder is rejected outright rather than silently
+    dropping the placeholder -- a script computing a menu line at runtime
+    is the for-loop detector's job, not this one's. Non-strict mode (used
+    for prompt/help labels, where approximate is fine) keeps whatever
+    literal text surrounds the placeholders."""
+    value = _literal_value(node)
+    if isinstance(value, str):
+        return _strip_ansi(value.strip())
+
+    if isinstance(node, ast.JoinedStr):
+        has_placeholder = any(isinstance(p, ast.FormattedValue) for p in node.values)
+        if strict and has_placeholder:
+            return None
+        parts = [
+            part.value for part in node.values
+            if isinstance(part, ast.Constant) and isinstance(part.value, str)
+        ]
+        return _strip_ansi("".join(parts).strip())
+
+    return None
+
+
 def _extract_string_arg(call_node, index=0):
     """Best-effort extraction of a call's Nth positional string argument
     (a prompt, help text, etc.), so an auto-generated field can have a
     useful label instead of a generic one."""
     if len(call_node.args) <= index:
         return ""
-
-    arg = call_node.args[index]
-    value = _literal_value(arg)
-    if isinstance(value, str):
-        return value.strip()
-
-    if isinstance(arg, ast.JoinedStr):  # f-string with only literal pieces
-        parts = [
-            part.value for part in arg.values
-            if isinstance(part, ast.Constant) and isinstance(part.value, str)
-        ]
-        return "".join(parts).strip()
-
-    return ""
+    return _extract_string_arg_node(call_node.args[index]) or ""
 
 
 _FILE_HINT_RE = re.compile(r"\.txt\b|\bfile\b", re.IGNORECASE)
@@ -244,52 +283,120 @@ def _maybe_mark_as_file(field):
     return field
 
 
-_MENU_LINE_RE = re.compile(r'^\s*(\d+)\s*[.)\-:]\s*(.+?)\s*$')
-_SIMPLE_PRINT_RE = re.compile(r'^print\(\s*f?[\'"](.*)[\'"]\s*\)\s*$')
-_COMMENT_RE = re.compile(r'^\s*#')
+# Matches "1. text", "1) text", "1 - text", "1: text", and bracketed
+# styles like "[1] text" or "(1) text" -- covers every numbered-menu
+# convention seen in practice, including colourised ones once ANSI codes
+# are stripped out first.
+_MENU_LINE_RE = re.compile(r'^\s*[\[\(]?\s*(\d+)\s*[\]\)\.\-:]?\s*(.+?)\s*$')
 
 
-def _collect_menu_options(source_lines, input_lineno, max_lookback=25):
-    """Look for a plain `print("N. option")`-per-line menu above an
-    input() call, and return (display_options, raw_values) if one is
-    recognized, else (None, None).
+def _extract_print_text(stmt):
+    """If `stmt` is a bare `print(...)` expression statement with only
+    statically-resolvable string arguments, return its joined, ANSI-
+    stripped text; otherwise None. A print() with a dynamic argument
+    (an f-string referencing a loop variable, a computed value, etc.)
+    also returns None -- that's a signal to the caller that whatever
+    menu-scan is in progress should stop here, not guess."""
+    if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Name) and stmt.value.func.id == "print"):
+        return None
+    if not stmt.value.args:
+        return None
 
-    Deliberately simple regex matching on raw source text rather than
-    full parsing. Blank lines and comments between the menu and the
-    input() (very common for readability) are skipped rather than
-    treated as "no menu here"; a single print() with embedded "\\n"
-    joining several options is also split apart. A non-numbered print()
-    line mixed into the block (a header like print("Choose a domain:")
-    right before the numbered options) is treated as a label and
-    ignored rather than aborting the whole match -- only a line that
-    isn't a print()/blank/comment at all stops the scan, so a for-loop
-    building the menu dynamically, or unrelated code above the prompt,
-    still safely yields no menu instead of a guess.
+    parts = []
+    for arg in stmt.value.args:
+        text = _extract_string_arg_node(arg, strict=True)
+        if text is None:
+            return None
+        parts.append(text)
+    return _strip_ansi(" ".join(parts))
+
+
+def _collect_print_menu(block, call_stmt_idx):
+    """Scan backward from block[call_stmt_idx] through the contiguous run
+    of plain `print(...)` statements immediately above it (comments and
+    blank lines aren't statements, so they're already transparent to
+    this) for numbered/bracketed menu options such as:
+        print("\\033[1;92m[1] Gmail.com\\033[0m")
+        print("\\033[1;92m[2] Yahoo.com\\033[0m")
+        domain = input("Select Domain : ")
+    and return (display_options, raw_values), or (None, None) if fewer
+    than two option-shaped lines are found. Stops the instant it hits any
+    statement that isn't a resolvable bare print() -- including another
+    input()-bearing statement, which marks a different, already-answered
+    prompt's territory, so two colourised menus back-to-back each match
+    their own input() instead of one bleeding into the other.
     """
-    menu_texts = []
-    idx = input_lineno - 2  # 0-indexed line immediately above the input() line
-    checked = 0
-    while idx >= 0 and checked < max_lookback:
-        checked += 1
-        line = source_lines[idx].strip()
-        if not line or _COMMENT_RE.match(line):
-            idx -= 1
-            continue
-        match = _SIMPLE_PRINT_RE.match(line)
-        if not match:
+    texts = []
+    for prev in reversed(block[:call_stmt_idx]):
+        text = _extract_print_text(prev)
+        if text is None:
             break
-        for part in reversed(match.group(1).split("\\n")):
-            menu_texts.insert(0, part)
-        idx -= 1
+        texts.insert(0, text)
 
     options, raw_values = [], []
-    for text in menu_texts:
-        m = _MENU_LINE_RE.match(text.strip())
-        if m:
-            raw_values.append(m.group(1))
-            options.append(f"{m.group(1)}) {m.group(2)}")
-        # else: a non-numbered line (header/label) -- ignore, don't abort
+    for text in texts:
+        for line in text.split("\n"):
+            m = _MENU_LINE_RE.match(line.strip())
+            if m:
+                raw_values.append(m.group(1))
+                options.append(f"{m.group(1)}) {m.group(2)}")
+            # else: a non-numbered line (header/label) -- ignore, don't abort
 
+    if len(options) >= 2:
+        return options, raw_values
+    return None, None
+
+
+# Same numbering shapes as _MENU_LINE_RE, but not anchored to the whole
+# line -- used to pull "[1] label" / "1. label" fragments out of a raw
+# source line regardless of what Python statement it's actually part of
+# (string concatenation, an unusual print() shape, etc.). Stops at the
+# first quote/backslash so it doesn't swallow the rest of the line.
+_RAW_MENU_ITEM_RE = re.compile(
+    r'[\[\(]?\s*(\d{1,2})\s*[\]\)]?\s*[.\-:]?\s*([A-Za-z0-9][A-Za-z0-9 ._@/:-]{0,40}?)(?=["\'\\]|$)'
+)
+_RAW_INPUT_CALL_RE = re.compile(r'\binput\s*\(')
+
+
+def _raw_regex_menu_scan(source_lines, input_lineno, lookback=6):
+    """Last-resort permissive fallback for menus the structural AST scan
+    can't cleanly resolve (a print() built from concatenation, an
+    f-string the strict extractor rejected, unusual formatting) -- scans
+    the raw text of up to `lookback` lines immediately above the input()
+    call (ANSI already stripped up front by _read_source_clean) for
+    "[1] label" / "1. label" / "1) label" fragments wherever they sit on
+    the line. Looser than the AST scan on purpose, and only consulted
+    when that scan found nothing -- a safety net, not the primary path.
+
+    Stops the instant it hits a line calling input() itself -- without
+    that boundary this would happily walk straight past a DIFFERENT,
+    already-answered prompt's menu and misattribute it to the current
+    one, since raw text has no notion of "which statement is this line
+    part of" the way the AST scan does.
+    """
+    start = max(0, input_lineno - 1 - lookback)
+    options, raw_values, seen = [], [], set()
+    for idx in range(input_lineno - 2, start - 1, -1):
+        raw_line = source_lines[idx]
+        if _RAW_INPUT_CALL_RE.search(raw_line):
+            break
+        # Matches within one line come out of finditer left-to-right
+        # already; only the *line* order needs reversing (we're walking
+        # upward from the input() call), so stack each line's matches
+        # onto the front as a whole rather than one at a time -- doing
+        # it one at a time would also flip the order of options that
+        # share a single line, e.g. print("1. Fast\n2. Stealth").
+        line_matches = []
+        for m in _RAW_MENU_ITEM_RE.finditer(raw_line):
+            num, label = m.group(1), m.group(2).strip()
+            if not label or num in seen:
+                continue
+            seen.add(num)
+            line_matches.append((num, label))
+        for num, label in reversed(line_matches):
+            raw_values.insert(0, num)
+            options.insert(0, f"{num}) {label}")
     if len(options) >= 2:
         return options, raw_values
     return None, None
@@ -404,17 +511,18 @@ def _contains_input_call(stmt):
 def _find_menu_for_call(block, call, literal_lists):
     """Depth-first: find the innermost block of statements that directly
     contains `call` (descending into if/for/while/try/function bodies so
-    a for-loop menu right next to the input(), not one merely earlier in
-    an enclosing function, wins), then look at the statement immediately
-    before it (skipping over plain print()/assignment "header" lines) for
-    a for-loop that builds a numbered/listed menu.
+    a menu right next to the input(), not one merely earlier in an
+    enclosing function, wins), then look backward through that same
+    block for either a for-loop that builds a numbered/listed menu, or a
+    run of plain print(...) statements with numbered/bracketed option
+    lines -- covers both `for i, x in enumerate(LIST): print(...)` and
+    literal `print("[1] ...")` per line above the input().
 
     Stops looking the instant it hits another input()-bearing statement
-    while scanning backward -- that boundary means any for-loop beyond it
+    while scanning backward -- that boundary means whatever's beyond it
     belongs to a *different*, already-answered prompt, not this one, so
     two menus back-to-back in the same block each get matched to their
-    own input() rather than both grabbing whichever menu happens to be
-    scanned first.
+    own input() rather than both grabbing whichever menu is found first.
     """
     for i, stmt in enumerate(block):
         if not _contains_call(stmt, call):
@@ -426,10 +534,13 @@ def _find_menu_for_call(block, call, literal_lists):
                     return options, raw_values
         for prev in reversed(block[:i]):
             if isinstance(prev, ast.For):
-                return _menu_from_for_loop(prev, literal_lists)
+                options, raw_values = _menu_from_for_loop(prev, literal_lists)
+                if options:
+                    return options, raw_values
+                break
             if _contains_input_call(prev):
                 break
-        return None, None
+        return _collect_print_menu(block, i)
     return None, None
 
 
@@ -446,8 +557,7 @@ def detect_inputs(script_path):
     flat, unconditional sequence of questions.
     """
     try:
-        with open(script_path, "r", encoding="utf-8") as f:
-            source = f.read()
+        source = _read_source_clean(script_path)
         tree = ast.parse(source, filename=script_path)
     except (OSError, UnicodeDecodeError, SyntaxError):
         return []
@@ -474,16 +584,19 @@ def detect_inputs(script_path):
             "required": False,
         }
 
-        # Two ways a menu can be built: a for-loop over a list (resolved
-        # via AST, handles the item text coming from a variable), or a
-        # literal print("N. option") per line right above the input()
-        # (regex-matched on source text). Try the AST-based one first --
-        # it's the more common style in real scripts and doesn't depend
-        # on the exact text ever being a source-code literal at the
-        # print() call site itself.
+        # Hybrid detection, most-structured first: an AST scan understands
+        # the code's actual shape (for-loops over a list, or a run of
+        # plain print() statements) and wins whenever it can resolve
+        # something; a permissive raw-text regex scan of the few lines
+        # right above the input() is the fallback for whatever shape the
+        # AST scan couldn't cleanly pin down (string concatenation, an
+        # f-string with runtime pieces the strict extractor won't guess
+        # at, etc.) -- so an unfamiliar menu style still has a decent
+        # chance of being caught instead of falling through to a blank
+        # text box.
         options, raw_values = _find_menu_for_call(tree.body, call, literal_lists)
         if not options:
-            options, raw_values = _collect_menu_options(source_lines, call.lineno)
+            options, raw_values = _raw_regex_menu_scan(source_lines, call.lineno)
         if options:
             # A numbered print() menu was found right above this input() --
             # render it as a dropdown instead of a plain text box. The
@@ -530,8 +643,7 @@ def detect_argparse_fields(script_path):
     needs zero changes to work here.
     """
     try:
-        with open(script_path, "r", encoding="utf-8") as f:
-            source = f.read()
+        source = _read_source_clean(script_path)
         tree = ast.parse(source, filename=script_path)
     except (OSError, UnicodeDecodeError, SyntaxError):
         return []
@@ -617,8 +729,7 @@ def detect_sys_argv_fields(script_path):
     of using argparse.
     """
     try:
-        with open(script_path, "r", encoding="utf-8") as f:
-            source = f.read()
+        source = _read_source_clean(script_path)
         tree = ast.parse(source, filename=script_path)
     except (OSError, UnicodeDecodeError, SyntaxError):
         return []
