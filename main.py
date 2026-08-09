@@ -208,24 +208,66 @@ class RootWidget(BoxLayout):
 
     # ---- One-time Termux setup -------------------------------------------
     def setup_termux(self):
-        """Copy the setup command and bring Termux to the front.
+        """Bring Termux to the front with the shortest possible command on
+        the clipboard for the user to paste there.
 
         Termux refuses RUN_COMMAND intents from other apps until
         `allow-external-apps=true` is set inside its own private
         ~/.termux/termux.properties. No app can write that file for the
-        user (that's Termux's whole point), so the best we can offer is:
-        copy the one-liner, open Termux, and let the user paste + Enter.
+        user (that's Termux's whole point). Pasting our full multi-command
+        setup line directly kept getting corrupted by a bracketed-paste
+        glitch on a real test device (confirmed: literal `^[[200~` escape
+        bytes leaking into the shell and breaking the first word of the
+        command, so nothing after it ran either). Publishing the setup
+        logic as a small script file via the same SAF mechanism used for
+        scripts, and only asking the user to paste a short `bash "<path>"`
+        line, leaves much less for a flaky paste to corrupt.
         """
-        Clipboard.copy(termux_bridge.SETUP_COMMAND)
+        command_to_paste = termux_bridge.SETUP_COMMAND
+        if self.shared_storage is not None:
+            published_path = self._publish_setup_script()
+            if published_path:
+                command_to_paste = f'bash "{published_path}"'
+
+        Clipboard.copy(command_to_paste)
         self._append_output(
             "[setup] Command copied to clipboard.\n"
             "[setup] Termux is opening -- long-press to Paste, then press Enter.\n"
+            "[setup] If the pasted line looks garbled/broken, don't run it -- "
+            "clear the line and type it by hand instead (it's short now).\n"
             "[setup] You only need to do this once.\n"
         )
         try:
             termux_bridge.open_termux()
         except Exception as exc:
             self._append_output(f"{self._friendly_error(exc)}\n")
+
+    def _publish_setup_script(self):
+        """Write SETUP_COMMAND to a small script file and publish it via
+        copy_to_shared(), so Termux only needs `bash "<real_path>"` typed
+        or pasted instead of the full multi-command line. Returns the real
+        path, or None if publishing failed (caller falls back to the full
+        command)."""
+        try:
+            from jnius import autoclass
+
+            Environment = autoclass("android.os.Environment")
+            cache_dir = self.shared_storage.get_cache_dir()
+            private_path = os.path.join(cache_dir, "setup.sh")
+            with open(private_path, "w", encoding="utf-8") as f:
+                f.write(termux_bridge.SETUP_COMMAND)
+
+            shared_uri = self.shared_storage.copy_to_shared(
+                private_path,
+                collection=Environment.DIRECTORY_DOCUMENTS,
+                filepath="setup.sh",
+            )
+            return self._uri_to_real_path(shared_uri) if shared_uri else None
+        except Exception as exc:
+            self._append_output(
+                f"[warn] Could not publish setup script ({exc}); using the full command instead.\n"
+            )
+            return None
 
     # ---- Storage access (Android 11+ scoped storage) ----------------------
     def request_storage_access(self):
