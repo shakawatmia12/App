@@ -190,21 +190,16 @@ KV = """
             width: dp(140)
             on_release: root.copy_output()
 
-    ScrollView:
-        id: output_scroll
+    TextInput:
+        id: output_label
+        text: root.output_text
+        readonly: True
+        multiline: True
         size_hint_y: 0.45
-        do_scroll_x: False
-
-        Label:
-            id: output_label
-            text: root.output_text
-            size_hint_y: None
-            height: self.texture_size[1]
-            text_size: self.width, None
-            halign: "left"
-            valign: "top"
-            color: 0, 1, 0, 1
-            padding: dp(6), dp(6)
+        background_color: 0, 0, 0, 1
+        foreground_color: 0, 1, 0, 1
+        cursor_color: 0, 1, 0, 1
+        padding: dp(6), dp(6)
 """
 
 
@@ -697,13 +692,28 @@ class RootWidget(BoxLayout):
         if self._poll_event:
             self._poll_event.cancel()
 
-        state = {"ticks": 0, "got_output": False, "hinted": False}
+        state = {"ticks": 0, "got_output": False, "hinted": False, "last_content": ""}
         max_ticks = max(1, silence_timeout_s // 2)
 
         def poll(_dt):
             content = reader()
-            if content and content != self.output_text:
-                self.output_text = content
+            if content and content != state["last_content"]:
+                # Termux's `tee` truncates and rewrites the log file fresh
+                # each run, so `content` usually grows on each poll while
+                # the command is still running. Append only the new suffix
+                # instead of replacing self.output_text wholesale -- a full
+                # replace here previously wiped out our own status lines
+                # ([schema]/[install] messages) and, combined with a
+                # Label+ScrollView height-binding quirk, could leave the
+                # box looking completely blank even though real output had
+                # been read successfully.
+                if content.startswith(state["last_content"]):
+                    new_part = content[len(state["last_content"]):]
+                else:
+                    new_part = content
+                if new_part.strip():
+                    self._append_output(new_part if new_part.endswith("\n") else new_part + "\n")
+                state["last_content"] = content
                 state["got_output"] = True
                 status_text, kind = self._classify_output(content)
                 self._set_status(status_text, kind)
@@ -746,6 +756,14 @@ class RootWidget(BoxLayout):
 
     def _append_output(self, text):
         self.output_text += text
+        widget = self.ids.get("output_label") if hasattr(self, "ids") else None
+        if widget is not None:
+            # Auto-scroll the terminal box to the newest line, like a real
+            # console tailing output, instead of leaving the view wherever
+            # it happened to be scrolled before.
+            Clock.schedule_once(
+                lambda dt: setattr(widget, "cursor", widget.get_cursor_from_index(len(widget.text)))
+            )
 
     def _show_message(self, message):
         Popup(
