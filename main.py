@@ -6,8 +6,11 @@ from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
 from kivy.lang import Builder
 from kivy.properties import StringProperty
+from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
 from kivy.uix.checkbox import CheckBox
+from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.spinner import Spinner
@@ -22,10 +25,12 @@ try:
 except ImportError:
     ON_ANDROID = False
 
-try:
-    from plyer import filechooser
-except ImportError:
-    filechooser = None
+# Root shared storage sits here on every real device; Termux (once
+# `termux-setup-storage` has run) sees the exact same tree, which is why
+# we browse it directly with Kivy's own FileChooser instead of Android's
+# SAF picker -- SAF hands back a content:// URI that neither our config
+# code nor Termux's shell can open as a plain file path.
+SDCARD_ROOT = "/sdcard"
 
 
 KV = """
@@ -40,11 +45,15 @@ KV = """
         spacing: dp(8)
 
         Button:
-            text: "Setup Termux (one-time)"
+            text: "Grant Storage Access"
+            on_release: root.request_storage_access()
+
+        Button:
+            text: "Setup Termux"
             on_release: root.setup_termux()
 
         Label:
-            text: "Do this once before your first run"
+            text: "Do both once before your first run"
             font_size: "12sp"
             color: 0.7, 0.7, 0.7, 1
 
@@ -162,26 +171,70 @@ class RootWidget(BoxLayout):
         except RuntimeError as exc:
             self._append_output(f"[error] {exc}\n")
 
+    # ---- Storage access (Android 11+ scoped storage) ----------------------
+    def request_storage_access(self):
+        """Guide the user to the one-tap "All files access" toggle.
+
+        On Android 11+, plain WRITE/READ_EXTERNAL_STORAGE no longer allows
+        opening arbitrary paths like /sdcard/config.json or a script the
+        user picked from anywhere in shared storage. That requires the
+        MANAGE_EXTERNAL_STORAGE special permission, which can only be
+        granted through a Settings screen -- no app can flip it for itself.
+        """
+        if not ON_ANDROID:
+            self._show_message("Storage access request only applies on Android.")
+            return
+        try:
+            from jnius import autoclass
+
+            Intent = autoclass("android.content.Intent")
+            Settings = autoclass("android.provider.Settings")
+            Uri = autoclass("android.net.Uri")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+
+            activity = PythonActivity.mActivity
+            package_name = activity.getPackageName()
+
+            intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+            intent.setData(Uri.parse(f"package:{package_name}"))
+            activity.startActivity(intent)
+            self._append_output(
+                "[setup] Opening storage settings -- toggle 'Allow access to "
+                "manage all files' on, then come back. One-time only.\n"
+            )
+        except Exception as exc:
+            self._append_output(f"[error] Could not open storage settings: {exc}\n")
+
     # ---- Script selection -------------------------------------------------
     def pick_script(self):
-        # Deliberately no `filters=` here: Android's native file picker
-        # (SAF) filters by MIME type, and ".py" has no reliable MIME
-        # mapping on most devices -- passing a filter made every .py file
-        # disappear from the picker. We show all files instead and
-        # validate the extension/content after the user picks one.
-        if filechooser is not None:
-            filechooser.open_file(
-                on_selection=self._on_file_selected,
-                path="/sdcard",
-            )
-        else:
-            self._show_message("File chooser is unavailable on this platform.")
+        chooser = FileChooserListView(
+            path=SDCARD_ROOT,
+            filters=["*.py"],
+            dirselect=False,
+        )
 
-    def _on_file_selected(self, selection):
-        if not selection:
-            return
-        # plyer's callback can fire off the main thread; hop back onto it.
-        Clock.schedule_once(lambda dt: self._load_script(selection[0]))
+        content = BoxLayout(orientation="vertical", spacing=dp(6))
+        content.add_widget(chooser)
+
+        button_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        cancel_btn = Button(text="Cancel")
+        select_btn = Button(text="Select")
+        button_row.add_widget(cancel_btn)
+        button_row.add_widget(select_btn)
+        content.add_widget(button_row)
+
+        popup = Popup(title="Select a .py script", content=content, size_hint=(0.95, 0.95))
+
+        def confirm(*_args):
+            if chooser.selection:
+                popup.dismiss()
+                self._load_script(chooser.selection[0])
+
+        select_btn.bind(on_release=confirm)
+        cancel_btn.bind(on_release=lambda *_a: popup.dismiss())
+        chooser.bind(on_submit=confirm)
+
+        popup.open()
 
     def _load_script(self, path):
         if not path.lower().endswith(".py"):
