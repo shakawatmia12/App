@@ -11,7 +11,12 @@ version = 1.0.0
 
 # main.py imports these; pyjnius drives the Termux RUN_COMMAND intent,
 # plyer provides the native Android file picker.
-requirements = python3,kivy==2.3.0,pyjnius,plyer,android
+# NOTE: do not pin kivy's version here. python-for-android's bundled
+# python3 recipe tracks a recent CPython (currently 3.14), and older Kivy
+# releases (e.g. 2.3.0) ship pre-generated Cython C code that fails to
+# compile against newer CPython C-API internals. Leaving kivy unpinned
+# lets pip resolve the latest release, which carries the compatibility fix.
+requirements = python3,kivy,pyjnius,plyer,android
 
 orientation = portrait
 fullscreen = 0
