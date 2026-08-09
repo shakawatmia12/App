@@ -158,11 +158,19 @@ def build_interactive_run_command(content, filename, extra_args=None, preset_ans
     mkdir = f"mkdir -p {' '.join(shlex.quote(d) for d in mkdir_dirs)}"
     write_all = " && ".join(write_parts)
 
-    # `exec 3>fifo` opens the FIFO's write end and keeps it held on fd 3
-    # for as long as this backgrounded subshell lives; `tail -f` never
-    # exits on its own, so that write end stays open for the script's
-    # whole run, and every line later appended to `answers` (see
-    # build_send_answer_command) gets relayed straight into the FIFO.
+    # `exec 3>fifo` opens the FIFO's write end and holds it on fd 3 for
+    # the life of this subshell. That fd only stays open as long as the
+    # subshell itself keeps running something -- if `tail -f` were the
+    # very last command and it ever exited on its own (killed, a
+    # transient error, Android reclaiming the process under memory
+    # pressure -- anything), the subshell would have nothing left to do
+    # and would exit too, closing fd 3 and delivering EOF to the
+    # script's next input() immediately, indistinguishable from the
+    # script actually seeing a blank answer. Wrapping it in `while true;
+    # do ... ; done` means the subshell always has something to run next,
+    # so fd 3 -- and the write end it holds -- can only ever close when
+    # this whole subshell is explicitly killed (see build_stop_command),
+    # never on its own.
     #
     # `rm`/`mkfifo`/truncating `answers` run BEFORE anything is
     # backgrounded, and the backgrounding itself is wrapped in its own
@@ -179,7 +187,8 @@ def build_interactive_run_command(content, filename, extra_args=None, preset_ans
     setup = (
         f"rm -f {shlex.quote(fifo)} && mkfifo {shlex.quote(fifo)} && "
         f"{seed_answers} && "
-        f"( ( exec 3>{shlex.quote(fifo)}; tail -n +1 -f {shlex.quote(answers)} >&3 ) & "
+        f"( ( exec 3>{shlex.quote(fifo)}; "
+        f"while true; do tail -n +1 -f {shlex.quote(answers)} >&3; sleep 1; done ) & "
         f"echo $! > {shlex.quote(feed_pid)} )"
     )
 
