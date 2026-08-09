@@ -128,7 +128,16 @@ def build_run_command_from_content(content, filename, extra_args=None, stdin_val
 
     mkdir = f"mkdir -p {' '.join(shlex.quote(d) for d in mkdir_dirs)}"
     write_all = " && ".join(write_parts)
-    run_inner = f"python {shlex.quote(script_path)} {args} {stdin_redirect}".strip()
+    # -u (and PYTHONUNBUFFERED as a belt-and-braces backup for any
+    # subprocess the script itself spawns) forces unbuffered stdout.
+    # Without it, CPython block-buffers stdout whenever it isn't a real
+    # TTY -- which it never is here, since we pipe through `tee` -- so
+    # print()/input() prompts can sit invisible in a buffer for minutes
+    # even though the script is running fine, and look identical to a
+    # hang. This affects every script, not just one with a certain shape.
+    run_inner = (
+        f"PYTHONUNBUFFERED=1 python -u {shlex.quote(script_path)} {args} {stdin_redirect}"
+    ).strip()
     # Backgrounded with its PID recorded so a later Stop action
     # (build_stop_command) can kill it -- RUN_COMMAND is fire-and-forget
     # and gives no other way to reach a process once it's running.
