@@ -317,7 +317,19 @@ class _BridgedStdin:
         return self.readline()
 
     def isatty(self):
-        return False
+        # Deliberately True, not a passthrough to the real fd: several
+        # "[1] Option" style menu libraries (questionary/InquirerPy/
+        # simple-term-menu and similar) check sys.stdin.isatty() BEFORE
+        # ever calling read()/readline(), and silently take a
+        # non-interactive fallback (often an immediate default/"invalid
+        # selection") when it's False -- bypassing every blocking
+        # guarantee in this class entirely, since they never reach it.
+        # Termux's real RUN_COMMAND stdin fd is not a tty, so reporting
+        # the honest answer here reproduces exactly that failure. This
+        # class already guarantees a real, blocking, human-driven read
+        # once a script does call in -- claiming tty support is accurate
+        # to that guarantee, not a lie to route around it.
+        return True
 
     def fileno(self):
         try:
