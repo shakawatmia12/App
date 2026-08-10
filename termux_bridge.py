@@ -147,11 +147,15 @@ def _run_paths(filename):
 # source.
 _WRAPPER_SOURCE_TEMPLATE = r'''
 import sys
-import socket
-import builtins
-import time
-import runpy
+import os
 import json
+import pty
+import select
+import socket
+import subprocess
+import termios
+import threading
+import time
 import traceback
 
 SCRIPT_PATH = __SCRIPT_PATH_REPR__
@@ -159,21 +163,6 @@ ARGS = __ARGS_REPR__
 HOST = __HOST_REPR__
 PORT = __PORT__
 FALLBACK_FIFO = __FALLBACK_FIFO_REPR__
-
-sys.argv = [SCRIPT_PATH] + list(ARGS)
-
-# PYTHONUNBUFFERED=1 and `python -u` are already set at the shell level
-# (see build_interactive_run_command's run_inner) -- that's what actually
-# unbuffers this whole process's stdio from the moment it starts, which a
-# reconfigure() call after the fact cannot retroactively fix if it didn't
-# take. This is just defense-in-depth for the narrow case where something
-# (a library the target script imports, a broken environment) resets
-# stdout's buffering mode after startup -- cheap, and never harmful.
-try:
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
-except (AttributeError, ValueError, OSError):
-    pass
 
 _channel = ("none", None)
 
@@ -214,199 +203,141 @@ def _connect():
 _connect()
 
 
-def _read_answer_line():
-    kind, chan = _channel
-    if chan is None:
-        while True:
-            time.sleep(1)
-    while True:
-        try:
-            line = chan.readline()
-        except OSError:
-            time.sleep(0.2)
-            continue
-        if line == "":
-            # Never trust a single empty read as a real answer -- a
-            # human never submits nothing, so treat it as "not ready
-            # yet" and keep waiting instead of handing the caller "".
-            time.sleep(0.1)
-            continue
-        return line.rstrip("\n")
-
-
-def _notify_prompt(prompt=""):
-    """Tell main.py a blocking read has actually started -- this is what
-    makes _on_socket_prompt fire the step UI immediately instead of
-    waiting out the quiet-tick timer. Shared by _bridged_input AND
-    _BridgedStdin below: a script that reads sys.stdin directly instead
-    of calling input() still needs this exact same live signal, or the
-    app would have no way to know it's time to show buttons at all --
-    blocking forever on a real answer is pointless if the UI never
-    appears to let a human provide one.
-    """
-    if _channel[0] == "socket":
-        try:
-            _channel[1].write("PROMPT:" + str(prompt).replace("\n", " ") + "\n")
-            _channel[1].flush()
-        except OSError:
-            pass
-
-
-def _bridged_input(prompt=""):
-    if prompt:
-        sys.__stdout__.write(str(prompt))
-        sys.__stdout__.flush()
-    _notify_prompt(prompt)
-    return _read_answer_line()
-
-
-builtins.input = _bridged_input
-
-
-class _BridgedStdout:
-    def __init__(self, real):
-        self._real = real
-
-    def write(self, text):
-        self._real.write(text)
-        if text and _channel[0] == "socket":
-            try:
-                _channel[1].write("OUT:" + text.replace("\n", "\x02") + "\n")
-                _channel[1].flush()
-            except OSError:
-                pass
-
-    def flush(self):
-        self._real.flush()
-
-    def isatty(self):
-        return False
-
-
-class _BridgedStdin:
-    """Overriding builtins.input alone is NOT enough: a script that reads
-    the domain/count/whatever straight off sys.stdin (sys.stdin.readline(),
-    sys.stdin.read(), or a bare `for line in sys.stdin:`) instead of
-    calling input() bypasses that patch completely and hits Termux's real
-    stdin fd -- which RUN_COMMAND does not connect to a live terminal, so
-    it behaves like /dev/null: any read on it returns "" (EOF) instantly.
-    That is indistinguishable, from the target script's own point of view,
-    from a human submitting a blank answer -- exactly the "Invalid Domain
-    Selected!"-before-any-button-exists failure this class exists to rule
-    out. Routing every stdin read through the SAME _read_answer_line()
-    blocking shield as _bridged_input means it no longer matters which of
-    the two ways a script chooses to ask -- both are guaranteed to block
-    for a genuine answer instead of ever seeing a blank/EOF read.
-    """
-
-    def readline(self, *_a, **_k):
-        _notify_prompt()
-        return _read_answer_line() + "\n"
-
-    def read(self, size=-1):
-        _notify_prompt()
-        line = _read_answer_line() + "\n"
-        if size is not None and size >= 0:
-            return line[:size]
-        return line
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return self.readline()
-
-    def isatty(self):
-        # Deliberately True, not a passthrough to the real fd: several
-        # "[1] Option" style menu libraries (questionary/InquirerPy/
-        # simple-term-menu and similar) check sys.stdin.isatty() BEFORE
-        # ever calling read()/readline(), and silently take a
-        # non-interactive fallback (often an immediate default/"invalid
-        # selection") when it's False -- bypassing every blocking
-        # guarantee in this class entirely, since they never reach it.
-        # Termux's real RUN_COMMAND stdin fd is not a tty, so reporting
-        # the honest answer here reproduces exactly that failure. This
-        # class already guarantees a real, blocking, human-driven read
-        # once a script does call in -- claiming tty support is accurate
-        # to that guarantee, not a lie to route around it.
-        return True
-
-    def fileno(self):
-        try:
-            return sys.__stdin__.fileno()
-        except (AttributeError, OSError, ValueError):
-            return -1
-
-    def flush(self):
+def _send(line):
+    # Only the socket side is bidirectional -- the FIFO fallback is a
+    # one-way answers feed with no return path to main.py at all, so
+    # status lines have nowhere to go there; main.py's own log-file
+    # polling is what covers that case instead, same as before this
+    # rewrite.
+    if _channel[0] != "socket":
+        return
+    try:
+        _channel[1].write(line)
+        _channel[1].flush()
+    except OSError:
         pass
-
-
-sys.stdout = _BridgedStdout(sys.stdout)
-sys.stdin = _BridgedStdin()
 
 
 def _report_fatal_error(exc):
-    """A script's own SystemExit (menu-driven CLIs routinely call
-    sys.exit() on bad input or a normal quit -- see multi3.py) is NOT a
-    crash and must never trigger this; only a genuinely UNCAUGHT
-    exception (a missing dependency's ImportError, any other runtime
-    error) reaches here. Two things happen: the human-readable traceback
-    goes through sys.stdout (the _BridgedStdout instance above), so it
-    reaches the terminal box over the SAME channel real output does --
-    fixing a real gap where an uncaught exception's default traceback
-    printed straight to the real stderr, which the shell's `2>&1 | tee`
-    still captured into the log file, but which never went out over the
-    socket and so was invisible for the rest of a run once the socket
-    channel had already taken over display (see main.py's
-    self._socket_active guard). Second, a compact JSON summary goes out
-    as its own ERR: message, giving the UI a structured signal to mark
-    the run as failed without having to text-sniff the traceback.
+    """Only reached for a failure in THIS wrapper's own pty/subprocess
+    plumbing (pty.openpty(), spawning the child, the relay loop itself)
+    -- never for the target script's own exceptions, which now run in a
+    genuinely separate process and simply print their own traceback to
+    their own stderr like Python always does, flowing through the same
+    pty-relay OUT: path as any other output with no special-casing
+    needed.
     """
     tb_text = traceback.format_exc()
+    text = "\n[FATAL] Wrapper crashed -- " + type(exc).__name__ + ": " + str(exc) + "\n" + tb_text
     try:
-        sys.stdout.write("\n[FATAL] Script crashed -- " + type(exc).__name__ + ": " + str(exc) + "\n")
-        sys.stdout.write(tb_text)
+        sys.stdout.write(text)
         sys.stdout.flush()
     except OSError:
         pass
-    if _channel[0] == "socket":
-        payload = json.dumps({"type": type(exc).__name__, "message": str(exc)})
-        try:
-            _channel[1].write("ERR:" + payload + "\n")
-            _channel[1].flush()
-        except OSError:
-            pass
+    _send("OUT:" + text.replace("\n", "\x02") + "\n")
+    payload = json.dumps({"type": type(exc).__name__, "message": str(exc)})
+    _send("ERR:" + payload + "\n")
 
 
+# Real PTY instead of Python-level input()/sys.stdin monkey-patching: some
+# interactive-menu libraries (questionary/InquirerPy/simple-term-menu and
+# similar) check the REAL underlying file descriptor via termios/tty
+# ioctls (or call os.isatty(fd) on the raw fd number) before ever calling
+# read()/readline() on the Python-level stdin object -- a fake
+# .isatty() == True on a plain pipe/socket does not fool those, since
+# they bypass any Python object entirely and ask the OS about the actual
+# fd. A genuine pty slave IS a real terminal device as far as the kernel
+# is concerned, so every such check succeeds honestly instead of needing
+# to be individually faked one mechanism at a time.
 try:
-    runpy.run_path(SCRIPT_PATH, run_name="__main__")
-except SystemExit as exc:
-    # sys.exit(0)/sys.exit()/sys.exit(<int>) -- a script's normal,
-    # intentional way to quit (a menu-driven CLI calling this after
-    # "Invalid selection", or just finishing) -- not a failure, nothing
-    # to report. sys.exit("some message") is different: Python's own
-    # default behaviour for a STRING exit code is to print that string
-    # to stderr, which previously landed only in the tee'd log (never
-    # over the socket -- the same visibility gap _report_fatal_error
-    # fixes below for uncaught exceptions) and could go missing entirely
-    # once the socket channel had already taken over display. Forward it
-    # as plain output, not a [FATAL] banner -- the script chose this exit
-    # deliberately, so it isn't a crash, just a message worth showing.
-    if isinstance(exc.code, str) and exc.code:
+    master_fd, slave_fd = pty.openpty()
+    try:
+        attrs = termios.tcgetattr(slave_fd)
+        attrs[3] = attrs[3] & ~termios.ECHO
+        termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+    except termios.error:
+        pass
+
+    proc = subprocess.Popen(
+        [sys.executable, "-u", SCRIPT_PATH] + list(ARGS),
+        stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+        preexec_fn=os.setsid, close_fds=True,
+    )
+    os.close(slave_fd)
+
+    def _pump_answers():
+        # Relays whatever main.py sends (a live socket line, or a preset
+        # answer pre-seeded into the FIFO-fallback answers file) straight
+        # into the pty's master side -- from the child's point of view
+        # that is indistinguishable from someone typing it on a real
+        # keyboard attached to a real terminal.
+        kind, chan = _channel
+        if chan is None:
+            return
+        while True:
+            try:
+                line = chan.readline()
+            except OSError:
+                break
+            if line == "":
+                break
+            try:
+                data = line if line.endswith("\n") else line + "\n"
+                os.write(master_fd, data.encode("utf-8", "replace"))
+            except OSError:
+                break
+
+    threading.Thread(target=_pump_answers, daemon=True).start()
+
+    _last_output_time = None
+    _prompted_since_output = False
+
+    while True:
+        finished = proc.poll() is not None
         try:
-            sys.stdout.write(exc.code if exc.code.endswith("\n") else exc.code + "\n")
-            sys.stdout.flush()
+            ready, _, _ = select.select([master_fd], [], [], 0.5)
         except OSError:
-            pass
+            break
+        got_data = False
+        if ready:
+            try:
+                data = os.read(master_fd, 65536)
+            except OSError:
+                data = b""
+            if data:
+                got_data = True
+                text = data.decode("utf-8", "replace")
+                sys.stdout.write(text)
+                sys.stdout.flush()
+                _send("OUT:" + text.replace("\n", "\x02") + "\n")
+                _last_output_time = time.time()
+                _prompted_since_output = False
+        if got_data:
+            continue
+        if finished:
+            break
+        # Quiet for a while after some real output -- the same "probably
+        # blocked on its next prompt" signal main.py's own polling
+        # fallback already used, just generated here instead, since
+        # there is no way to hook a real subprocess's own input() calls
+        # directly anymore. This is what makes _on_socket_prompt show
+        # the step UI over the live socket channel -- without it the run
+        # would sit there correctly blocked, with no visible way to
+        # answer it.
+        if (
+            _last_output_time is not None
+            and not _prompted_since_output
+            and (time.time() - _last_output_time) > 1.0
+        ):
+            _send("PROMPT:\n")
+            _prompted_since_output = True
+
+    proc.wait()
+    os.close(master_fd)
 except BaseException as exc:
     _report_fatal_error(exc)
 finally:
-    if _channel[0] == "socket":
-        try:
-            _channel[1].write("DONE:\n")
-            _channel[1].flush()
-        except OSError:
-            pass
+    _send("DONE:\n")
 '''
 
 
