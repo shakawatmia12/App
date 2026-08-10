@@ -16,6 +16,7 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
+from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 
@@ -295,6 +296,7 @@ class RootWidget(BoxLayout):
         # populated while a wizard dialog sequence is actually open.
         self._wizard_steps = []
         self._wizard_answers = []
+        self._manual_steps = []
         # Preset answers still waiting to be auto-fed once the socket
         # channel confirms a prompt actually happened (see
         # _on_socket_prompt) -- the FIFO-fallback path pre-seeds the
@@ -841,32 +843,125 @@ class RootWidget(BoxLayout):
 
     # ---- Preset Wizard: build a preset with zero script execution ------
     def open_preset_wizard(self):
-        """Phase 1 of the Preset Wizard: build a named preset purely from
-        this script's saved schema (see preset_db.save_schema) -- no
-        Python process, no Termux command, nothing runs in the
-        background. Walks the exact steps a REAL run already showed
-        (recorded live by _show_step_ui), one at a time, as a dialog.
+        """Phase 1 of the Preset Wizard: build a named preset without
+        running the script or touching Termux. Two paths depending on
+        whether a schema exists yet for this script (see
+        preset_db.save_schema):
 
-        If no schema has been recorded yet there is nothing to build
-        from -- says so plainly instead of guessing at what the script
-        might ask, the same evidence-over-guessing rule this project has
-        followed since the FIFO/stdin fixes.
+        - A schema already exists (this script has been run
+          interactively at least once, or a preset was already built
+          manually before -- see _open_manual_step_builder) -- replay
+          those exact steps as buttons/text boxes (_show_wizard_step).
+        - No schema yet -- rather than refusing outright, fall back to
+          letting the user type each answer value directly, in order
+          (_open_manual_step_builder). Less convenient (plain text
+          boxes, no tap-to-pick menu buttons, since there's no real run
+          to have detected any menu from) but functionally identical
+          once sent to the script's stdin, and it's what actually lets a
+          preset be built before the script has ever been run.
         """
         if not self.script_path:
             self._show_message("Select a script first.")
             return
         steps = preset_db.load_schema(self.script_name)
         if not steps:
-            self._show_message(
-                "No recorded steps yet for this script -- run it once "
-                "interactively and answer its prompts, then Build Preset "
-                "will be available. It replays exactly what that run saw, "
-                "so it never needs to run the script again after that."
-            )
+            self._open_manual_step_builder()
             return
         self._wizard_steps = steps
         self._wizard_answers = []
         self._show_wizard_step(0)
+
+    def _open_manual_step_builder(self):
+        """No prior run means no auto-detected schema to replay -- let
+        the user type each answer value directly, in the exact order the
+        script will ask for them, building the preset from scratch.
+
+        Also saves a matching (menu-less) schema alongside the preset,
+        so building a SECOND preset for this same never-run script goes
+        through the normal replay wizard instead of this manual entry
+        screen again -- each step just shows as a plain text box there,
+        same as it does here.
+        """
+        self._manual_steps = []
+
+        outer = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(10))
+        popup = Popup(title="Build Preset -- No Run Yet", content=outer, size_hint=(0.92, 0.8))
+
+        hint = Label(
+            text=(
+                "No recorded run for this script yet. Type the answers "
+                "you want sent, one at a time, in the exact order the "
+                "script will ask for them (e.g. domain choice, then "
+                "thread count)."
+            ),
+            size_hint_y=None, height=dp(64), halign="left", valign="top",
+        )
+        hint.bind(width=lambda inst, v: setattr(inst, "text_size", (v, None)))
+
+        steps_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
+        steps_box.bind(minimum_height=steps_box.setter("height"))
+        scroll = ScrollView(size_hint_y=1)
+        scroll.add_widget(steps_box)
+
+        answer_input = TextInput(
+            hint_text="Answer for the next step, e.g. 1", multiline=False,
+            size_hint_y=None, height=dp(44),
+        )
+
+        def _refresh_list():
+            steps_box.clear_widgets()
+            for i, value in enumerate(self._manual_steps):
+                steps_box.add_widget(Label(
+                    text=f"Step {i + 1}: {value!r}", size_hint_y=None, height=dp(28),
+                    halign="left", valign="middle",
+                ))
+
+        def _add_step(*_a):
+            value = answer_input.text.strip()
+            if not value:
+                self._show_message("Type a value before adding the step.")
+                return
+            self._manual_steps.append(value)
+            answer_input.text = ""
+            _refresh_list()
+
+        add_btn = Button(text="Add Step", size_hint_x=None, width=dp(90))
+        add_btn.bind(on_release=_add_step)
+
+        input_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        input_row.add_widget(answer_input)
+        input_row.add_widget(add_btn)
+
+        btn_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        cancel_btn = Button(text="Cancel")
+        finish_btn = Button(text="Finish & Save")
+        btn_row.add_widget(cancel_btn)
+        btn_row.add_widget(finish_btn)
+
+        def _finish(*_a):
+            if not self._manual_steps:
+                self._show_message("Add at least one step first.")
+                return
+            popup.dismiss()
+            answers = list(self._manual_steps)
+            schema = [
+                {"prompt": f"Step {i + 1}", "options": None, "raw_values": None}
+                for i in range(len(answers))
+            ]
+            preset_db.save_schema(self.script_name, schema)
+            self._wizard_answers = answers
+            self._finish_wizard()
+
+        cancel_btn.bind(on_release=lambda *_a: popup.dismiss())
+        finish_btn.bind(on_release=_finish)
+
+        outer.add_widget(hint)
+        outer.add_widget(scroll)
+        outer.add_widget(input_row)
+        outer.add_widget(btn_row)
+
+        _refresh_list()
+        popup.open()
 
     def _show_wizard_step(self, index):
         if index >= len(self._wizard_steps):
