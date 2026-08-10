@@ -1,6 +1,7 @@
 """Termux Script Management Wrapper - GUI Dashboard & Terminal Console UI."""
 import json
 import os
+import shlex
 import socket
 import threading
 import time
@@ -113,6 +114,21 @@ KV = """
             text: root.script_name or "No script selected"
             shorten: True
             shorten_from: "left"
+
+    BoxLayout:
+        size_hint_y: None
+        height: dp(44)
+        spacing: dp(8)
+
+        Label:
+            text: "CLI Args:"
+            size_hint_x: None
+            width: dp(70)
+
+        TextInput:
+            id: extra_args_input
+            multiline: False
+            hint_text: "optional, e.g. 1 2 -- only if the script reads sys.argv"
 
     BoxLayout:
         size_hint_y: None
@@ -886,6 +902,24 @@ class RootWidget(BoxLayout):
         filename = os.path.basename(self._readable_script_path)
         self._current_filename = filename
 
+        extra_args_raw = self.ids.extra_args_input.text.strip() if hasattr(self, "ids") else ""
+        extra_args = []
+        if extra_args_raw:
+            try:
+                extra_args = shlex.split(extra_args_raw)
+            except ValueError as exc:
+                # Unbalanced quotes etc. -- refuse to launch with a
+                # half-parsed argument list rather than guess at what the
+                # user meant.
+                self._show_message(f"Could not parse CLI Args: {exc}")
+                return
+            self._append_output(
+                f"[run] Passing CLI arguments to sys.argv: {extra_args!r} -- the "
+                "script only sees these if it actually reads sys.argv itself; "
+                "plain input()/sys.stdin calls are unaffected and still work "
+                "through the live step UI below.\n"
+            )
+
         preset_answers = None
         if self.selected_preset and self.selected_preset != self.MANUAL_LABEL:
             preset_answers = list(self._presets.get(self.selected_preset, []))
@@ -919,7 +953,7 @@ class RootWidget(BoxLayout):
         self._set_status("Sending Run Script command to Termux...", "info")
         if not self._run_bridge_action(
             lambda: termux_bridge.run_script_interactive(
-                content, filename, preset_answers=preset_answers,
+                content, filename, extra_args=extra_args, preset_answers=preset_answers,
             )
         ):
             return
