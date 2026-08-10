@@ -1,6 +1,7 @@
 """Termux Script Management Wrapper - GUI Dashboard & Terminal Console UI."""
 import json
 import os
+import random
 import shlex
 import socket
 import threading
@@ -166,6 +167,13 @@ KV = """
             values: root.preset_names
             on_text: root.on_preset_selected(self.text)
 
+    Label:
+        text: root.schema_status_text
+        size_hint_y: None
+        height: dp(24) if root.schema_status_text else 0
+        color: 0.6, 0.85, 1, 1
+        font_size: dp(13)
+
     ScrollView:
         size_hint_y: None
         height: dp(220)
@@ -196,6 +204,10 @@ KV = """
         Button:
             text: "Build Preset"
             on_release: root.open_preset_wizard()
+
+        Button:
+            text: "Test"
+            on_release: root.test_run()
 
         Button:
             text: "Install Packages"
@@ -259,6 +271,7 @@ class RootWidget(BoxLayout):
     run_button_text = StringProperty("Run Script")
     preset_names = ListProperty(["Manual (no preset)"])
     selected_preset = StringProperty("Manual (no preset)")
+    schema_status_text = StringProperty("")
 
     STATUS_COLORS = {
         "info": [0.16, 0.32, 0.5, 1],
@@ -303,6 +316,11 @@ class RootWidget(BoxLayout):
         # answers as a preset once it ends, instead of the normal
         # "tap Save Config yourself" flow.
         self._preset_build_mode = False
+        # Set only by test_run() -- tells _show_step_ui to auto-answer
+        # every prompt (see _auto_answer_step) instead of waiting for a
+        # human tap, so a script's prompt sequence can be walked and
+        # recorded as a schema with no manual interaction at all.
+        self._auto_explore_mode = False
         # Preset answers still waiting to be auto-fed once the socket
         # channel confirms a prompt actually happened (see
         # _on_socket_prompt) -- the FIFO-fallback path pre-seeds the
@@ -769,6 +787,7 @@ class RootWidget(BoxLayout):
         self._presets = self._load_presets()
         self.preset_names = [self.MANUAL_LABEL] + sorted(self._presets.keys())
         self.selected_preset = self.MANUAL_LABEL
+        self._refresh_schema_status()
 
         self._append_output(
             f"[script] Loaded '{self.script_name}'. Run Script executes it live "
@@ -793,6 +812,21 @@ class RootWidget(BoxLayout):
 
     def on_preset_selected(self, value):
         self.selected_preset = value
+
+    def _refresh_schema_status(self):
+        """Keeps the small status line under the Preset dropdown honest
+        about whether this script's steps have already been recorded
+        (see preset_db.save_schema) -- so it's obvious at a glance
+        whether Test/a live run is still needed, or Build Preset can
+        already replay real answers with zero execution."""
+        if not self.script_name:
+            self.schema_status_text = ""
+            return
+        steps = preset_db.load_schema(self.script_name)
+        if steps:
+            self.schema_status_text = f"Test data: Yes -- {len(steps)} step(s) already recorded"
+        else:
+            self.schema_status_text = "Test data: No -- tap Test to record it automatically"
 
     # ---- Actions -------------------------------------------------
     def save_config(self):
@@ -848,6 +882,39 @@ class RootWidget(BoxLayout):
         popup.open()
 
     # ---- Preset Wizard: build a preset with zero script execution ------
+    def test_run(self):
+        """Auto-explore this script live through Termux -- same
+        sandboxed run as Run Script, except every prompt gets answered
+        automatically (see _auto_answer_step: a "skip"-labelled option
+        if one exists, otherwise a random option, or a generic
+        placeholder for a plain text prompt) instead of waiting for a
+        human tap. The point isn't a correct/meaningful run -- it's
+        purely to walk through the script's prompt sequence once so its
+        schema gets recorded (see preset_db.save_schema), with zero
+        manual interaction. Once this finishes, Build Preset can offer
+        real tap-able buttons for this script without ever running it
+        again -- and _refresh_schema_status (the "Test data: Yes/No"
+        line under the Preset dropdown) reflects that immediately.
+
+        Deliberately does NOT offer to save the random/skip answers
+        themselves as a usable preset (see _maybe_prompt_preset_save,
+        which only fires for _preset_build_mode, never this) -- they're
+        throwaway values, not something worth reusing.
+        """
+        if not self.script_path:
+            self._show_message("Select a script first.")
+            return
+        if not self._check_termux_ready():
+            return
+        self.selected_preset = self.MANUAL_LABEL
+        self._auto_explore_mode = True
+        self._append_output(
+            "[test] Auto-exploring this script -- every prompt will be "
+            "answered automatically (skip/random), just to record its "
+            "steps for Build Preset. This is not a real/meaningful run.\n"
+        )
+        self.run_script()
+
     def open_preset_wizard(self):
         """Phase 1 of the Preset Wizard: build a named preset. Two paths
         depending on whether a schema exists yet for this script (see
@@ -1042,6 +1109,7 @@ class RootWidget(BoxLayout):
             answers = list(self._manual_steps)
             schema = list(self._manual_schema)
             preset_db.save_schema(self.script_name, schema)
+            self._refresh_schema_status()
             self._wizard_answers = answers
             self._finish_wizard()
 
@@ -1270,6 +1338,8 @@ class RootWidget(BoxLayout):
             self._poll_event.cancel()
         if self._recorded_steps:
             preset_db.save_schema(self.script_name, self._recorded_steps)
+            self._refresh_schema_status()
+        self._auto_explore_mode = False
         self._set_status("Stop signal sent.", "warn")
         self._maybe_prompt_preset_save()
 
@@ -1303,6 +1373,7 @@ class RootWidget(BoxLayout):
                 # user meant.
                 self._show_message(f"Could not parse CLI Args: {exc}")
                 self._preset_build_mode = False
+                self._auto_explore_mode = False
                 return
             self._append_output(
                 f"[run] Passing CLI arguments to sys.argv: {extra_args!r} -- the "
@@ -1361,12 +1432,51 @@ class RootWidget(BoxLayout):
         if panel is not None:
             panel.clear_widgets()
 
+    def _auto_answer_step(self, chunk):
+        """Auto-explore mode (see test_run): instead of showing buttons
+        and waiting for a human tap, immediately pick an answer for
+        whatever the script just asked and submit it -- an option whose
+        label mentions "skip" if there is one, otherwise a random
+        option, or a generic placeholder if no menu was detected at all.
+        The goal isn't a correct/complete run, just to walk through as
+        many of the script's prompts as possible so this step still gets
+        recorded into self._recorded_steps (same as _show_step_ui does
+        for a normal run) without a human sitting through every prompt.
+        """
+        self._shown_chunk_len = len(chunk)
+        prompt = schema_engine.last_prompt_line(chunk)
+        options, raw_values = schema_engine.parse_menu_options(chunk)
+        self._recorded_steps.append({
+            "prompt": prompt or "",
+            "options": options,
+            "raw_values": raw_values,
+        })
+
+        if raw_values:
+            skip_idx = next(
+                (i for i, opt in enumerate(options) if "skip" in opt.lower()), None
+            )
+            if skip_idx is not None:
+                value = raw_values[skip_idx]
+                note = f"skip option {options[skip_idx]!r}"
+            else:
+                value = random.choice(raw_values)
+                note = f"random option {value!r}"
+        else:
+            value = "1"
+            note = "no menu detected -- generic placeholder"
+        self._append_output(f"[test] Prompt: {prompt!r} -- auto-answering with {note}\n")
+        self._submit_answer(value)
+
     def _show_step_ui(self, chunk):
         """Build buttons/inputs from whatever the script printed since the
         last answer (see schema_engine.parse_menu_options/last_prompt_line)
         -- these read the script's REAL rendered output, so it doesn't
         matter how the script's source built that text (colour codes,
         f-strings, a loop, argparse, anything)."""
+        if self._auto_explore_mode:
+            self._auto_answer_step(chunk)
+            return
         self._awaiting_input = True
         # Remember exactly how much of _pending_chunk this UI was built
         # from -- if the script prints its NEXT prompt before the user
@@ -1715,12 +1825,21 @@ class RootWidget(BoxLayout):
         # supplied that preset.
         if self._recorded_steps:
             preset_db.save_schema(self.script_name, self._recorded_steps)
+            self._refresh_schema_status()
+        was_auto_explore = self._auto_explore_mode
+        self._auto_explore_mode = False
         note = (
             f" {len(self._collected_answers)} answer(s) were given this run -- "
             "tap Save Config to store them as a reusable preset."
             if self._collected_answers else ""
         )
         self._append_output(f"[run] Script process has exited.{note}\n")
+        if was_auto_explore:
+            self._append_output(
+                "[test] Test run finished -- this script's steps are now "
+                "saved. Tap Build Preset to pick real answers without "
+                "running it again.\n"
+            )
         self._maybe_prompt_preset_save()
 
     def _classify_output(self, content):
