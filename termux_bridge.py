@@ -151,6 +151,8 @@ import socket
 import builtins
 import time
 import runpy
+import json
+import traceback
 
 SCRIPT_PATH = __SCRIPT_PATH_REPR__
 ARGS = __ARGS_REPR__
@@ -270,8 +272,62 @@ class _BridgedStdout:
 
 sys.stdout = _BridgedStdout(sys.stdout)
 
+
+def _report_fatal_error(exc):
+    """A script's own SystemExit (menu-driven CLIs routinely call
+    sys.exit() on bad input or a normal quit -- see multi3.py) is NOT a
+    crash and must never trigger this; only a genuinely UNCAUGHT
+    exception (a missing dependency's ImportError, any other runtime
+    error) reaches here. Two things happen: the human-readable traceback
+    goes through sys.stdout (the _BridgedStdout instance above), so it
+    reaches the terminal box over the SAME channel real output does --
+    fixing a real gap where an uncaught exception's default traceback
+    printed straight to the real stderr, which the shell's `2>&1 | tee`
+    still captured into the log file, but which never went out over the
+    socket and so was invisible for the rest of a run once the socket
+    channel had already taken over display (see main.py's
+    self._socket_active guard). Second, a compact JSON summary goes out
+    as its own ERR: message, giving the UI a structured signal to mark
+    the run as failed without having to text-sniff the traceback.
+    """
+    tb_text = traceback.format_exc()
+    try:
+        sys.stdout.write("\n[FATAL] Script crashed -- " + type(exc).__name__ + ": " + str(exc) + "\n")
+        sys.stdout.write(tb_text)
+        sys.stdout.flush()
+    except OSError:
+        pass
+    if _channel[0] == "socket":
+        payload = json.dumps({"type": type(exc).__name__, "message": str(exc)})
+        try:
+            _channel[1].write("ERR:" + payload + "\n")
+            _channel[1].flush()
+        except OSError:
+            pass
+
+
 try:
     runpy.run_path(SCRIPT_PATH, run_name="__main__")
+except SystemExit as exc:
+    # sys.exit(0)/sys.exit()/sys.exit(<int>) -- a script's normal,
+    # intentional way to quit (a menu-driven CLI calling this after
+    # "Invalid selection", or just finishing) -- not a failure, nothing
+    # to report. sys.exit("some message") is different: Python's own
+    # default behaviour for a STRING exit code is to print that string
+    # to stderr, which previously landed only in the tee'd log (never
+    # over the socket -- the same visibility gap _report_fatal_error
+    # fixes below for uncaught exceptions) and could go missing entirely
+    # once the socket channel had already taken over display. Forward it
+    # as plain output, not a [FATAL] banner -- the script chose this exit
+    # deliberately, so it isn't a crash, just a message worth showing.
+    if isinstance(exc.code, str) and exc.code:
+        try:
+            sys.stdout.write(exc.code if exc.code.endswith("\n") else exc.code + "\n")
+            sys.stdout.flush()
+        except OSError:
+            pass
+except BaseException as exc:
+    _report_fatal_error(exc)
 finally:
     if _channel[0] == "socket":
         try:

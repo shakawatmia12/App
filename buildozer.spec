@@ -39,7 +39,16 @@ fullscreen = 0
 # com.termux.permission.RUN_COMMAND: required by Termux to accept our
 # RUN_COMMAND intent (Termux declares this as a signature/normal permission
 # depending on version; requesting it here is required either way).
-android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,MANAGE_EXTERNAL_STORAGE,com.termux.permission.RUN_COMMAND,INTERNET
+# WAKE_LOCK: needed for the PARTIAL_WAKE_LOCK held for the duration of a
+# script run (see main.py's _acquire_wakelock) -- keeps the CPU from
+# deep-sleeping mid-run if the screen times out, independent of whatever
+# the OS/OEM battery manager decides about the process itself.
+# REQUEST_IGNORE_BATTERY_OPTIMIZATIONS: needed to show the system's own
+# "exempt this app from battery optimization" dialog (see
+# request_battery_optimization_exemption) -- this is the actual, real
+# mitigation for aggressive OEM task killers (Samsung's included) that a
+# WakeLock alone does not prevent.
+android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,MANAGE_EXTERNAL_STORAGE,com.termux.permission.RUN_COMMAND,INTERNET,WAKE_LOCK,REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
 
 # Reverted: lowering android.api to 28 to dodge scoped storage also drags
 # compileSdkVersion down with it in this p4a version (they're the same

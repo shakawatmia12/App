@@ -1,4 +1,5 @@
 """Termux Script Management Wrapper - GUI Dashboard & Terminal Console UI."""
+import json
 import os
 import socket
 import threading
@@ -88,8 +89,12 @@ KV = """
             text: "Setup Termux"
             on_release: root.setup_termux()
 
+        Button:
+            text: "Keep App Awake"
+            on_release: root.request_battery_optimization_exemption()
+
         Label:
-            text: "Do both once before your first run"
+            text: "Do all three once before your first run"
             font_size: "12sp"
             color: 0.7, 0.7, 0.7, 1
 
@@ -274,6 +279,10 @@ class RootWidget(BoxLayout):
         self._socket_conn = None
         self._socket_active = False
         self._socket_lock = threading.Lock()
+        # Lazily created by _acquire_wakelock on the first run -- a real
+        # android.os.PowerManager.WakeLock object once on Android, stays
+        # None (and every wakelock call is a no-op) off-Android.
+        self._wakelock = None
 
         if ON_ANDROID and SharedStorage is not None and Chooser is not None:
             self.shared_storage = SharedStorage()
@@ -375,6 +384,9 @@ class RootWidget(BoxLayout):
             elif line.startswith("OUT:"):
                 text = line[len("OUT:"):].replace("\x02", "\n")
                 Clock.schedule_once(lambda dt, t=text: self._on_socket_output(t))
+            elif line.startswith("ERR:"):
+                payload = line[len("ERR:"):]
+                Clock.schedule_once(lambda dt, p=payload: self._on_socket_error(p))
             elif line.startswith("DONE:"):
                 Clock.schedule_once(lambda dt: self._on_socket_done())
 
@@ -406,6 +418,29 @@ class RootWidget(BoxLayout):
             return
         chunk = self._pending_chunk if self._pending_chunk.strip() else prompt_text
         self._show_step_ui(chunk)
+
+    def _on_socket_error(self, payload):
+        """The wrapper's _report_fatal_error sent this after the target
+        script raised something it never caught itself (missing
+        dependency, any other runtime error) -- distinct from the script
+        calling sys.exit() on its own, which the wrapper deliberately
+        does NOT report here since that's routine control flow for a
+        menu-driven CLI, not a failure. The human-readable traceback was
+        already sent as normal OUT: text right before this and is already
+        visible above in the terminal box; this just gives the status bar
+        a clear, structured "this run failed" signal instead of leaving
+        it to _classify_output's best-effort text sniffing.
+        """
+        if not self._script_running:
+            return
+        try:
+            data = json.loads(payload)
+        except (ValueError, TypeError):
+            data = {"type": "Error", "message": payload}
+        self._set_status(
+            f"Script crashed: {data.get('type', 'Error')} -- see Terminal Output below.",
+            "error",
+        )
 
     def _on_socket_done(self):
         self._finish_run()
@@ -512,6 +547,88 @@ class RootWidget(BoxLayout):
                 f"[Debug] {type(exc).__name__}: {exc}\n"
             )
             self._open_app_settings()
+
+    def request_battery_optimization_exemption(self):
+        """Ask the OS to stop applying battery-optimization throttling to
+        THIS app -- a PARTIAL_WAKE_LOCK (see _acquire_wakelock) keeps the
+        CPU from deep-sleeping mid-run, but it does nothing against an
+        OEM task killer (Samsung's power management included) deciding to
+        kill a recently-backgrounded app outright to save battery. This
+        system dialog is the actual, user-grantable fix for that -- one
+        tap, one time, same pattern as request_storage_access().
+        """
+        if not ON_ANDROID:
+            self._show_message("Battery optimization exemption only applies on Android.")
+            return
+        try:
+            from jnius import autoclass
+
+            Intent = autoclass("android.content.Intent")
+            Uri = autoclass("android.net.Uri")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+
+            activity = PythonActivity.mActivity
+            package_name = activity.getPackageName()
+
+            intent = Intent("android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS")
+            intent.setData(Uri.parse(f"package:{package_name}"))
+            activity.startActivity(intent)
+            self._append_output(
+                "[setup] Opening battery optimization exemption request -- allow "
+                "it so Android/your phone's power manager doesn't kill this app "
+                "while a script is running in the background. One-time only.\n"
+            )
+        except Exception as exc:
+            # Some ROMs don't ship this exact action (or Play Protect
+            # policy variants reject it) -- same calm-fallback pattern as
+            # request_storage_access(): send the user to the app's own
+            # battery settings page instead of crashing/looking broken.
+            self._append_output(
+                "[setup] That direct shortcut isn't available on this device -- "
+                "opening this app's settings page instead. Look for 'Battery' "
+                "there and set it to 'Unrestricted'.\n"
+                f"[Debug] {type(exc).__name__}: {exc}\n"
+            )
+            self._open_app_settings()
+
+    def _acquire_wakelock(self):
+        """Hold a PARTIAL_WAKE_LOCK for the duration of a script run --
+        keeps the CPU running (screen can still turn off) so a run isn't
+        silently paused mid-way if the screen times out while the user
+        isn't actively tapping anything. Independent of, and weaker than,
+        the battery-optimization exemption above (that's about the OS not
+        killing the whole process; this is about the CPU not sleeping
+        while it's still alive) -- both matter, neither substitutes for
+        the other.
+        """
+        if not ON_ANDROID:
+            return
+        try:
+            from jnius import autoclass
+
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            Context = autoclass("android.content.Context")
+            PowerManager = autoclass("android.os.PowerManager")
+
+            activity = PythonActivity.mActivity
+            power_service = activity.getSystemService(Context.POWER_SERVICE)
+            if self._wakelock is None:
+                self._wakelock = power_service.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK, "ScriptWrapper::RunLock"
+                )
+            if not self._wakelock.isHeld():
+                self._wakelock.acquire()
+        except Exception as exc:
+            self._append_output(f"[Debug] WakeLock unavailable ({type(exc).__name__}: {exc}) -- continuing without it.\n")
+
+    def _release_wakelock(self):
+        if self._wakelock is None:
+            return
+        try:
+            if self._wakelock.isHeld():
+                self._wakelock.release()
+        except Exception:
+            pass
 
     def _open_app_settings(self):
         try:
@@ -744,6 +861,7 @@ class RootWidget(BoxLayout):
         self.run_button_text = "Run Script"
         self._awaiting_input = False
         self._close_socket_conn()
+        self._release_wakelock()
         self._show_finished_notice("Script Stopped")
         if self._poll_event:
             self._poll_event.cancel()
@@ -807,6 +925,7 @@ class RootWidget(BoxLayout):
             return
         self._script_running = True
         self.run_button_text = "Stop Script"
+        self._acquire_wakelock()
         self._set_status("Sent -- waiting for Termux output...", "info")
         self._start_polling(termux_bridge.read_run_log, silence_timeout_s=30, interactive=True)
 
@@ -1149,6 +1268,7 @@ class RootWidget(BoxLayout):
         self.run_button_text = "Run Script"
         self._awaiting_input = False
         self._close_socket_conn()
+        self._release_wakelock()
         self._show_finished_notice("Script Finished")
         if self._poll_event:
             self._poll_event.cancel()
@@ -1217,6 +1337,8 @@ class ScriptWrapperApp(App):
                 server.close()
             except OSError:
                 pass
+        if widget is not None:
+            widget._release_wakelock()
 
 
 if __name__ == "__main__":
