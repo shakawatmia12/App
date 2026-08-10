@@ -164,7 +164,7 @@ HOST = __HOST_REPR__
 PORT = __PORT__
 FALLBACK_FIFO = __FALLBACK_FIFO_REPR__
 
-_channel = ("none", None)
+_channel = ("none", None, None)
 
 # main.py's socket server starts in a background thread during its own
 # __init__ -- there is a real window, right after this wrapper process
@@ -183,9 +183,17 @@ def _connect():
     for attempt in range(_CONNECT_RETRIES):
         try:
             sock = socket.create_connection((HOST, PORT), timeout=5)
-            _channel = ("socket", sock.makefile(
-                "rw", encoding="utf-8", newline="\n", errors="replace"
-            ))
+            # Two independent makefile() objects, not one shared "rw" one:
+            # _send() writes on the main relay thread while _pump_answers()
+            # blocks on reads from a background thread, and a single
+            # TextIOWrapper is not safe to read and write concurrently from
+            # different threads -- that race has been observed to hand the
+            # child a corrupted/blank line ahead of the real answer.
+            # Separate objects mean separate internal buffers, so the two
+            # directions never touch each other's state.
+            rfile = sock.makefile("r", encoding="utf-8", newline="\n", errors="replace")
+            wfile = sock.makefile("w", encoding="utf-8", newline="\n", errors="replace")
+            _channel = ("socket", rfile, wfile)
             return
         except OSError:
             if attempt < _CONNECT_RETRIES - 1:
@@ -195,9 +203,9 @@ def _connect():
         # (a mis-encoded print(), binary-ish output) must never raise and
         # kill this whole relay -- better to show a replacement character
         # than crash the bridge and lose the rest of the run's output.
-        _channel = ("fifo", open(FALLBACK_FIFO, "r", encoding="utf-8", errors="replace"))
+        _channel = ("fifo", open(FALLBACK_FIFO, "r", encoding="utf-8", errors="replace"), None)
     except OSError:
-        _channel = ("none", None)
+        _channel = ("none", None, None)
 
 
 _connect()
@@ -212,8 +220,8 @@ def _send(line):
     if _channel[0] != "socket":
         return
     try:
-        _channel[1].write(line)
-        _channel[1].flush()
+        _channel[2].write(line)
+        _channel[2].flush()
     except OSError:
         pass
 
@@ -271,7 +279,7 @@ try:
         # into the pty's master side -- from the child's point of view
         # that is indistinguishable from someone typing it on a real
         # keyboard attached to a real terminal.
-        kind, chan = _channel
+        kind, chan, _wfile = _channel
         if chan is None:
             return
         while True:
@@ -295,7 +303,7 @@ try:
     while True:
         finished = proc.poll() is not None
         try:
-            ready, _, _ = select.select([master_fd], [], [], 0.5)
+            ready, _, _ = select.select([master_fd], [], [], 0.15)
         except OSError:
             break
         got_data = False
@@ -327,7 +335,7 @@ try:
         if (
             _last_output_time is not None
             and not _prompted_since_output
-            and (time.time() - _last_output_time) > 1.0
+            and (time.time() - _last_output_time) > 0.35
         ):
             _send("PROMPT:\n")
             _prompted_since_output = True
