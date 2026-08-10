@@ -297,6 +297,7 @@ class RootWidget(BoxLayout):
         self._wizard_steps = []
         self._wizard_answers = []
         self._manual_steps = []
+        self._manual_schema = []
         # Preset answers still waiting to be auto-fed once the socket
         # channel confirms a prompt actually happened (see
         # _on_socket_prompt) -- the FIFO-fallback path pre-seeds the
@@ -872,29 +873,37 @@ class RootWidget(BoxLayout):
         self._show_wizard_step(0)
 
     def _open_manual_step_builder(self):
-        """No prior run means no auto-detected schema to replay -- let
-        the user type each answer value directly, in the exact order the
-        script will ask for them, building the preset from scratch.
+        """No prior run means no auto-detected schema to replay -- build
+        the preset from scratch instead, one step at a time, as either:
 
-        Also saves a matching (menu-less) schema alongside the preset,
-        so building a SECOND preset for this same never-run script goes
-        through the normal replay wizard instead of this manual entry
-        screen again -- each step just shows as a plain text box there,
-        same as it does here.
+        - a Menu Step: define option names + the raw values the script
+          expects for them (you already know your own script's menu),
+          then TAP the one you want -- same tap-to-pick feel as the
+          real-run wizard's buttons, without ever running the script.
+        - a Text Step: type the answer value directly, for anything that
+          isn't a menu (a count, a proxy string, etc).
+
+        Also saves a matching schema alongside the preset (menu steps
+        keep their full option list, text steps have options=None), so
+        building a SECOND preset for this same never-run script goes
+        through the normal replay wizard next time -- menu steps show
+        as real tap-able buttons there too, not just here.
         """
         self._manual_steps = []
+        self._manual_schema = []
 
         outer = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(10))
-        popup = Popup(title="Build Preset -- No Run Yet", content=outer, size_hint=(0.92, 0.8))
+        popup = Popup(title="Build Preset -- No Run Yet", content=outer, size_hint=(0.92, 0.85))
 
         hint = Label(
             text=(
-                "No recorded run for this script yet. Type the answers "
-                "you want sent, one at a time, in the exact order the "
-                "script will ask for them (e.g. domain choice, then "
-                "thread count)."
+                "No recorded run for this script yet. Add each step in "
+                "the exact order the script will ask for it -- a Menu "
+                "Step if it's a numbered choice (define the options once, "
+                "then tap the one you want), or a Text Step for anything "
+                "else."
             ),
-            size_hint_y=None, height=dp(64), halign="left", valign="top",
+            size_hint_y=None, height=dp(74), halign="left", valign="top",
         )
         hint.bind(width=lambda inst, v: setattr(inst, "text_size", (v, None)))
 
@@ -903,30 +912,55 @@ class RootWidget(BoxLayout):
         scroll = ScrollView(size_hint_y=1)
         scroll.add_widget(steps_box)
 
+        def _refresh_list():
+            steps_box.clear_widgets()
+            for i, (value, entry) in enumerate(zip(self._manual_steps, self._manual_schema)):
+                options = entry.get("options")
+                if options:
+                    raw_values = entry.get("raw_values") or []
+                    label = options[raw_values.index(value)] if value in raw_values else value
+                    text = f"Step {i + 1} (menu): {label} -> {value!r}"
+                else:
+                    text = f"Step {i + 1}: {value!r}"
+                steps_box.add_widget(Label(
+                    text=text, size_hint_y=None, height=dp(28),
+                    halign="left", valign="middle",
+                ))
+
+        def _add_text_step(value):
+            self._manual_steps.append(value)
+            self._manual_schema.append(
+                {"prompt": f"Step {len(self._manual_steps)}", "options": None, "raw_values": None}
+            )
+            _refresh_list()
+
+        def _add_menu_step(options, raw_values, chosen_value):
+            self._manual_steps.append(chosen_value)
+            self._manual_schema.append({
+                "prompt": f"Step {len(self._manual_steps)}",
+                "options": options,
+                "raw_values": raw_values,
+            })
+            _refresh_list()
+
         answer_input = TextInput(
             hint_text="Answer for the next step, e.g. 1", multiline=False,
             size_hint_y=None, height=dp(44),
         )
-
-        def _refresh_list():
-            steps_box.clear_widgets()
-            for i, value in enumerate(self._manual_steps):
-                steps_box.add_widget(Label(
-                    text=f"Step {i + 1}: {value!r}", size_hint_y=None, height=dp(28),
-                    halign="left", valign="middle",
-                ))
 
         def _add_step(*_a):
             value = answer_input.text.strip()
             if not value:
                 self._show_message("Type a value before adding the step.")
                 return
-            self._manual_steps.append(value)
+            _add_text_step(value)
             answer_input.text = ""
-            _refresh_list()
 
-        add_btn = Button(text="Add Step", size_hint_x=None, width=dp(90))
+        add_btn = Button(text="Add Text Step", size_hint_x=None, width=dp(120))
         add_btn.bind(on_release=_add_step)
+
+        menu_btn = Button(text="Add Menu Step", size_hint_y=None, height=dp(44))
+        menu_btn.bind(on_release=lambda *_a: self._open_menu_step_definer(_add_menu_step))
 
         input_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
         input_row.add_widget(answer_input)
@@ -944,10 +978,7 @@ class RootWidget(BoxLayout):
                 return
             popup.dismiss()
             answers = list(self._manual_steps)
-            schema = [
-                {"prompt": f"Step {i + 1}", "options": None, "raw_values": None}
-                for i in range(len(answers))
-            ]
+            schema = list(self._manual_schema)
             preset_db.save_schema(self.script_name, schema)
             self._wizard_answers = answers
             self._finish_wizard()
@@ -958,9 +989,91 @@ class RootWidget(BoxLayout):
         outer.add_widget(hint)
         outer.add_widget(scroll)
         outer.add_widget(input_row)
+        outer.add_widget(menu_btn)
         outer.add_widget(btn_row)
 
         _refresh_list()
+        popup.open()
+
+    def _open_menu_step_definer(self, on_done):
+        """Nested dialog opened by _open_manual_step_builder's 'Add Menu
+        Step': define a menu's options (a display name plus the raw
+        value the script actually expects for it, e.g. "Domain1" / "1"),
+        then TAP the option you want as this preset's answer for the
+        step -- exactly like tapping a real run's detected menu buttons,
+        just built from what you already know about your own script
+        instead of from a live run's output.
+
+        `on_done(options, raw_values, chosen_value)` fires once a tap
+        picks one -- the full option list is kept (not just the tapped
+        one), so replaying this schema later for another preset offers
+        every option as a real button too, not just this one choice.
+        """
+        pending_options = []
+        pending_raw_values = []
+
+        outer = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(10))
+        popup = Popup(title="Define Menu Options", content=outer, size_hint=(0.92, 0.85))
+
+        hint = Label(
+            text=(
+                "Add each option's name and the value the script expects "
+                "for it (e.g. Domain1 / 1), one at a time. Once you've "
+                "added them, tap the option you want for THIS preset."
+            ),
+            size_hint_y=None, height=dp(60), halign="left", valign="top",
+        )
+        hint.bind(width=lambda inst, v: setattr(inst, "text_size", (v, None)))
+
+        options_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
+        options_box.bind(minimum_height=options_box.setter("height"))
+        scroll = ScrollView(size_hint_y=1)
+        scroll.add_widget(options_box)
+
+        def _finalize(raw_value):
+            popup.dismiss()
+            on_done(list(pending_options), list(pending_raw_values), raw_value)
+
+        def _refresh_options():
+            options_box.clear_widgets()
+            for label, raw in zip(pending_options, pending_raw_values):
+                btn = Button(text=f"{label}  ({raw})", size_hint_y=None, height=dp(40))
+                btn.bind(on_release=lambda *_a, v=raw: _finalize(v))
+                options_box.add_widget(btn)
+
+        label_input = TextInput(hint_text="Option name, e.g. Domain1", multiline=False,
+                                 size_hint_y=None, height=dp(44))
+        value_input = TextInput(hint_text="Value, e.g. 1", multiline=False,
+                                 size_hint_y=None, height=dp(44))
+
+        def _add_option(*_a):
+            label = label_input.text.strip()
+            value = value_input.text.strip()
+            if not label or not value:
+                self._show_message("Enter both an option name and its value.")
+                return
+            pending_options.append(label)
+            pending_raw_values.append(value)
+            label_input.text = ""
+            value_input.text = ""
+            _refresh_options()
+
+        add_opt_btn = Button(text="Add Option", size_hint_y=None, height=dp(44))
+        add_opt_btn.bind(on_release=_add_option)
+
+        input_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        input_row.add_widget(label_input)
+        input_row.add_widget(value_input)
+
+        cancel_btn = Button(text="Cancel", size_hint_y=None, height=dp(44))
+        cancel_btn.bind(on_release=lambda *_a: popup.dismiss())
+
+        outer.add_widget(hint)
+        outer.add_widget(scroll)
+        outer.add_widget(input_row)
+        outer.add_widget(add_opt_btn)
+        outer.add_widget(cancel_btn)
+
         popup.open()
 
     def _show_wizard_step(self, index):
