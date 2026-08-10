@@ -449,7 +449,8 @@ def build_interactive_run_command(content, filename, extra_args=None, preset_ans
     RUN_COMMAND has no such EOF hazard.
 
     preset_answers: an optional list of answers known up front (loaded
-    from a saved preset -- see build_save_preset_command) is pre-written
+    from a saved preset -- see preset_db.py, entirely local to the app,
+    no Termux involvement in storing/loading it) is pre-written
     into the answers file for the FIFO-fallback case (main.py separately
     auto-answers from the same preset over the socket when that's the
     active channel), so a run goes hands-free through however many of
@@ -591,49 +592,6 @@ def build_stop_command(filename):
     )
 
 
-def presets_path_for(script_name):
-    import schema_engine
-
-    return f"{CONFIGS_DIR}/{schema_engine.sanitize_name(script_name)}_presets.json"
-
-
-def build_save_preset_command(script_name, preset_name, answers):
-    """Have Termux merge one named preset (an ordered list of answers)
-    into that script's presets JSON file, keeping any other presets
-    already saved there. The merge itself runs as a tiny Python snippet
-    *inside Termux* (base64-transferred the same way a script itself is)
-    rather than trying to hand-roll a shell one-liner that reads-modifies-
-    writes JSON -- Termux always has Python available (it's this whole
-    app's baseline requirement), and repr() safely escapes the embedded
-    strings/lists as valid Python source, so there's no shell-quoting
-    hazard from whatever characters are in the answers themselves.
-    """
-    path = presets_path_for(script_name)
-    snippet = (
-        "import json\n"
-        f"path = {path!r}\n"
-        f"name = {preset_name!r}\n"
-        f"answers = {list(answers)!r}\n"
-        "try:\n"
-        "    with open(path, 'r', encoding='utf-8') as f:\n"
-        "        data = json.load(f)\n"
-        "    if not isinstance(data, dict):\n"
-        "        data = {}\n"
-        "except Exception:\n"
-        "    data = {}\n"
-        "data[name] = answers\n"
-        "with open(path, 'w', encoding='utf-8') as f:\n"
-        "    json.dump(data, f, indent=2, ensure_ascii=False)\n"
-        "print('Preset saved: ' + name)\n"
-    )
-    encoded_snippet = base64.b64encode(snippet.encode("utf-8")).decode("ascii")
-    snippet_path = f"{CONFIGS_DIR}/_save_preset.py"
-    mkdir = f"mkdir -p {shlex.quote(CONFIGS_DIR)}"
-    write = f"echo {shlex.quote(encoded_snippet)} | base64 -d > {shlex.quote(snippet_path)}"
-    run = f"python {shlex.quote(snippet_path)}"
-    return f"{mkdir} && {write} && {run}"
-
-
 def _to_java_string_array(items):
     """Fallback manual String[] builder if jnius' list-autoconvert fails."""
     from jnius import autoclass, cast
@@ -744,14 +702,6 @@ def stop_script(filename):
     process and FIFO. Sent quietly in the background -- there's no
     separate output to watch for."""
     command = build_stop_command(filename)
-    send_termux_command(command, background=True)
-    return command
-
-
-def save_preset(script_name, preset_name, answers):
-    """Save Config Action: persist the given answer sequence under a name
-    Termux can look up again later (see build_save_preset_command)."""
-    command = build_save_preset_command(script_name, preset_name, answers)
     send_termux_command(command, background=True)
     return command
 

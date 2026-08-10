@@ -19,6 +19,7 @@ from kivy.uix.popup import Popup
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 
+import preset_db
 import schema_engine
 import termux_bridge
 
@@ -192,6 +193,10 @@ KV = """
             on_release: root.save_config()
 
         Button:
+            text: "Build Preset"
+            on_release: root.open_preset_wizard()
+
+        Button:
             text: "Install Packages"
             on_release: root.install_packages()
 
@@ -280,6 +285,16 @@ class RootWidget(BoxLayout):
         self._quiet_ticks = 0
         self._awaiting_input = False
         self._collected_answers = []
+        # Every step (prompt text + any detected menu options) the live
+        # step UI has shown this run, in order -- see _show_step_ui.
+        # Persisted as this script's schema once the run finishes (see
+        # _finish_run) so the Preset Wizard can replay the same steps
+        # later without running the script again.
+        self._recorded_steps = []
+        # Preset Wizard scratch state (see open_preset_wizard) -- only
+        # populated while a wizard dialog sequence is actually open.
+        self._wizard_steps = []
+        self._wizard_answers = []
         # Preset answers still waiting to be auto-fed once the socket
         # channel confirms a prompt actually happened (see
         # _on_socket_prompt) -- the FIFO-fallback path pre-seeds the
@@ -730,6 +745,7 @@ class RootWidget(BoxLayout):
         self._script_running = False
         self.run_button_text = "Run Script"
         self._collected_answers = []
+        self._recorded_steps = []
         self._pending_chunk = ""
         self._shown_chunk_len = 0
         self._quiet_ticks = 0
@@ -761,19 +777,11 @@ class RootWidget(BoxLayout):
             )
 
     def _load_presets(self):
-        """Best-effort read of this script's saved presets.
-
-        Termux owns this file (plain path under termux_bridge.CONFIGS_DIR,
-        written by save_config()'s embedded snippet) -- our own process
-        reading it directly can fail silently on Android 10+ scoped
-        storage, in which case this just returns {} and only "Manual"
-        shows up in the dropdown.
-        """
-        if not self.script_name:
-            return {}
-        path = termux_bridge.presets_path_for(self.script_name)
-        data = schema_engine.load_json_file(path)
-        return data if isinstance(data, dict) else {}
+        """This script's saved presets, from the app's own local sqlite
+        database (preset_db.py) -- entirely local to this app's private
+        storage, no Termux round-trip and no /sdcard scoped-storage
+        quirks to fail silently against."""
+        return preset_db.load_presets(self.script_name)
 
     def on_preset_selected(self, value):
         self.selected_preset = value
@@ -781,11 +789,11 @@ class RootWidget(BoxLayout):
     # ---- Actions -------------------------------------------------
     def save_config(self):
         """Persist the answers given during the last/current interactive
-        run as a named, reusable preset."""
+        run as a named, reusable preset. Purely local (see preset_db.py)
+        -- no Termux involved in saving a preset, only in the run that
+        produced the answers being saved."""
         if not self.script_path:
             self._show_message("Select a script first.")
-            return
-        if not self._check_termux_ready():
             return
         if not self._collected_answers:
             self._show_message(
@@ -819,14 +827,123 @@ class RootWidget(BoxLayout):
                 return
             popup.dismiss()
             answers = list(self._collected_answers)
-            self._append_output(f"[config] Saving preset '{name}' ({len(answers)} answer(s)) via Termux...\n")
-            self._set_status("Sending Save Config to Termux...", "info")
-            if self._run_bridge_action(lambda: termux_bridge.save_preset(self.script_name, name, answers)):
-                self._presets[name] = answers
-                if name not in self.preset_names:
-                    self.preset_names = self.preset_names + [name]
-                self.selected_preset = name
-                self._set_status(f"Preset '{name}' saved.", "success")
+            preset_db.save_preset(self.script_name, name, answers)
+            self._presets[name] = answers
+            if name not in self.preset_names:
+                self.preset_names = self.preset_names + [name]
+            self.selected_preset = name
+            self._append_output(f"[config] Preset '{name}' saved ({len(answers)} answer(s)).\n")
+            self._set_status(f"Preset '{name}' saved.", "success")
+
+        ok_btn.bind(on_release=_do_save)
+        cancel_btn.bind(on_release=lambda *_a: popup.dismiss())
+        popup.open()
+
+    # ---- Preset Wizard: build a preset with zero script execution ------
+    def open_preset_wizard(self):
+        """Phase 1 of the Preset Wizard: build a named preset purely from
+        this script's saved schema (see preset_db.save_schema) -- no
+        Python process, no Termux command, nothing runs in the
+        background. Walks the exact steps a REAL run already showed
+        (recorded live by _show_step_ui), one at a time, as a dialog.
+
+        If no schema has been recorded yet there is nothing to build
+        from -- says so plainly instead of guessing at what the script
+        might ask, the same evidence-over-guessing rule this project has
+        followed since the FIFO/stdin fixes.
+        """
+        if not self.script_path:
+            self._show_message("Select a script first.")
+            return
+        steps = preset_db.load_schema(self.script_name)
+        if not steps:
+            self._show_message(
+                "No recorded steps yet for this script -- run it once "
+                "interactively and answer its prompts, then Build Preset "
+                "will be available. It replays exactly what that run saw, "
+                "so it never needs to run the script again after that."
+            )
+            return
+        self._wizard_steps = steps
+        self._wizard_answers = []
+        self._show_wizard_step(0)
+
+    def _show_wizard_step(self, index):
+        if index >= len(self._wizard_steps):
+            self._finish_wizard()
+            return
+        step = self._wizard_steps[index]
+        prompt = step.get("prompt") or f"Step {index + 1}"
+        options = step.get("options")
+        raw_values = step.get("raw_values")
+
+        content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(10))
+        content.add_widget(self._step_label(f"Step {index + 1}/{len(self._wizard_steps)}: {prompt}"))
+        popup = Popup(title="Build Preset", content=content, size_hint=(0.9, 0.6))
+
+        def _advance(value):
+            self._wizard_answers.append(value)
+            popup.dismiss()
+            self._show_wizard_step(index + 1)
+
+        if options:
+            for opt, raw in zip(options, raw_values):
+                btn = Button(text=opt, size_hint_y=None, height=dp(40))
+                btn.bind(on_release=lambda *_a, v=raw: _advance(v))
+                content.add_widget(btn)
+        else:
+            answer_input = TextInput(multiline=False, size_hint_y=None, height=dp(44))
+            content.add_widget(answer_input)
+
+            def _submit_text(*_a):
+                value = answer_input.text.strip()
+                if not value:
+                    self._show_message("Enter a value before continuing.")
+                    return
+                _advance(value)
+
+            next_btn = Button(text="Next", size_hint_y=None, height=dp(44))
+            next_btn.bind(on_release=_submit_text)
+            content.add_widget(next_btn)
+
+        cancel_btn = Button(text="Cancel Wizard", size_hint_y=None, height=dp(36))
+        cancel_btn.bind(on_release=lambda *_a: popup.dismiss())
+        content.add_widget(cancel_btn)
+        popup.open()
+
+    def _finish_wizard(self):
+        answers = list(self._wizard_answers)
+        content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(10))
+        content.add_widget(Label(
+            text=f"All {len(answers)} step(s) answered. Save this as a preset named:",
+            size_hint_y=None, height=dp(30),
+        ))
+        name_input = TextInput(multiline=False, size_hint_y=None, height=dp(44))
+        content.add_widget(name_input)
+        btn_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        cancel_btn = Button(text="Cancel")
+        ok_btn = Button(text="Save")
+        btn_row.add_widget(cancel_btn)
+        btn_row.add_widget(ok_btn)
+        content.add_widget(btn_row)
+        popup = Popup(title="Save Preset", content=content, size_hint=(0.85, 0.35))
+
+        def _do_save(*_a):
+            name = name_input.text.strip()
+            if not name:
+                self._show_message("Enter a preset name.")
+                return
+            popup.dismiss()
+            preset_db.save_preset(self.script_name, name, answers)
+            self._presets[name] = answers
+            if name not in self.preset_names:
+                self.preset_names = self.preset_names + [name]
+            self.selected_preset = name
+            self._append_output(
+                f"[wizard] Preset '{name}' built from {len(answers)} step(s) -- "
+                "no script execution was needed.\n"
+            )
+            self._set_status(f"Preset '{name}' saved.", "success")
 
         ok_btn.bind(on_release=_do_save)
         cancel_btn.bind(on_release=lambda *_a: popup.dismiss())
@@ -881,6 +998,8 @@ class RootWidget(BoxLayout):
         self._show_finished_notice("Script Stopped")
         if self._poll_event:
             self._poll_event.cancel()
+        if self._recorded_steps:
+            preset_db.save_schema(self.script_name, self._recorded_steps)
         self._set_status("Stop signal sent.", "warn")
 
     def run_script(self):
@@ -930,6 +1049,7 @@ class RootWidget(BoxLayout):
             )
 
         self._collected_answers = []
+        self._recorded_steps = []
         self._pending_chunk = ""
         self._shown_chunk_len = 0
         self._quiet_ticks = 0
@@ -997,6 +1117,14 @@ class RootWidget(BoxLayout):
             f"[debug] Prompt chunk: {schema_engine.strip_ansi(chunk)!r}\n"
             f"[debug] Detected options: {options!r} raw_values: {raw_values!r}\n"
         )
+        # Record this step for the Preset Wizard (see preset_db.save_schema,
+        # called from _finish_run once the whole run is done) -- evidence
+        # of what the script actually asked, not a guess.
+        self._recorded_steps.append({
+            "prompt": prompt or "",
+            "options": options,
+            "raw_values": raw_values,
+        })
 
         panel = self.ids.step_panel
         panel.clear_widgets()
@@ -1306,6 +1434,15 @@ class RootWidget(BoxLayout):
         self._show_finished_notice("Script Finished")
         if self._poll_event:
             self._poll_event.cancel()
+        # Persist whatever steps this run's live step UI actually showed
+        # (see _show_step_ui) as this script's schema -- evidence from a
+        # real run, not a guess -- so Build Preset can replay them later
+        # with zero execution. A run driven entirely by an auto-answered
+        # preset records nothing new here, which is fine: the schema it
+        # would produce is already saved from whatever earlier run first
+        # supplied that preset.
+        if self._recorded_steps:
+            preset_db.save_schema(self.script_name, self._recorded_steps)
         note = (
             f" {len(self._collected_answers)} answer(s) were given this run -- "
             "tap Save Config to store them as a reusable preset."
