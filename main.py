@@ -298,6 +298,11 @@ class RootWidget(BoxLayout):
         self._wizard_answers = []
         self._manual_steps = []
         self._manual_schema = []
+        # Set only by _offer_live_or_manual_build's "Run Live" choice --
+        # tells _finish_run/stop_script to offer saving this run's
+        # answers as a preset once it ends, instead of the normal
+        # "tap Save Config yourself" flow.
+        self._preset_build_mode = False
         # Preset answers still waiting to be auto-fed once the socket
         # channel confirms a prompt actually happened (see
         # _on_socket_prompt) -- the FIFO-fallback path pre-seeds the
@@ -844,33 +849,90 @@ class RootWidget(BoxLayout):
 
     # ---- Preset Wizard: build a preset with zero script execution ------
     def open_preset_wizard(self):
-        """Phase 1 of the Preset Wizard: build a named preset without
-        running the script or touching Termux. Two paths depending on
-        whether a schema exists yet for this script (see
+        """Phase 1 of the Preset Wizard: build a named preset. Two paths
+        depending on whether a schema exists yet for this script (see
         preset_db.save_schema):
 
         - A schema already exists (this script has been run
           interactively at least once, or a preset was already built
           manually before -- see _open_manual_step_builder) -- replay
-          those exact steps as buttons/text boxes (_show_wizard_step).
-        - No schema yet -- rather than refusing outright, fall back to
-          letting the user type each answer value directly, in order
-          (_open_manual_step_builder). Less convenient (plain text
-          boxes, no tap-to-pick menu buttons, since there's no real run
-          to have detected any menu from) but functionally identical
-          once sent to the script's stdin, and it's what actually lets a
-          preset be built before the script has ever been run.
+          those exact steps as buttons/text boxes (_show_wizard_step),
+          zero execution needed.
+        - No schema yet -- offer a choice (_offer_live_or_manual_build)
+          instead of guessing or forcing typed-only entry: run the
+          script live through Termux (the same sandboxed run_script()
+          this app already uses for Run Script -- real detected menu
+          buttons, tap them exactly like a normal run, then the answers
+          get offered as a preset once it's done), or type the steps in
+          by hand without running anything at all.
         """
         if not self.script_path:
             self._show_message("Select a script first.")
             return
         steps = preset_db.load_schema(self.script_name)
         if not steps:
-            self._open_manual_step_builder()
+            self._offer_live_or_manual_build()
             return
         self._wizard_steps = steps
         self._wizard_answers = []
         self._show_wizard_step(0)
+
+    def _offer_live_or_manual_build(self):
+        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
+        content.add_widget(self._step_label(
+            "No recorded steps yet for this script. Build this preset by "
+            "actually running it once live through Termux -- the normal "
+            "safe, sandboxed Run Script, with real menu buttons to tap -- "
+            "or type the steps in by hand without running anything."
+        ))
+        btn_col = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(140), spacing=dp(8))
+        live_btn = Button(text="Run Live via Termux (Recommended)")
+        manual_btn = Button(text="Type Steps Manually")
+        cancel_btn = Button(text="Cancel")
+        btn_col.add_widget(live_btn)
+        btn_col.add_widget(manual_btn)
+        btn_col.add_widget(cancel_btn)
+        content.add_widget(btn_col)
+        popup = Popup(title="Build Preset", content=content, size_hint=(0.9, 0.55))
+
+        def _go_live(*_a):
+            popup.dismiss()
+            if not self._check_termux_ready():
+                return
+            # This run must be answered live by the user tapping/typing,
+            # not auto-fed from whatever preset happened to be selected
+            # last -- the whole point is to observe (and record) real
+            # prompts as they're actually answered.
+            self.selected_preset = self.MANUAL_LABEL
+            self._preset_build_mode = True
+            self.run_script()
+
+        def _go_manual(*_a):
+            popup.dismiss()
+            self._open_manual_step_builder()
+
+        live_btn.bind(on_release=_go_live)
+        manual_btn.bind(on_release=_go_manual)
+        cancel_btn.bind(on_release=lambda *_a: popup.dismiss())
+        popup.open()
+
+    def _maybe_prompt_preset_save(self):
+        """Called from both _finish_run and stop_script once a run
+        started via 'Build Preset -> Run Live' (see
+        _offer_live_or_manual_build) ends, one way or another. Reuses
+        Save Config's own name-prompt popup -- a preset built this way
+        isn't structurally different from one saved after a plain manual
+        run, just triggered from a different button."""
+        if not self._preset_build_mode:
+            return
+        self._preset_build_mode = False
+        if self._collected_answers:
+            self._prompt_preset_name()
+        else:
+            self._show_message(
+                "No prompts were answered during that run -- nothing to "
+                "save as a preset yet."
+            )
 
     def _open_manual_step_builder(self):
         """No prior run means no auto-detected schema to replay -- build
@@ -1209,6 +1271,7 @@ class RootWidget(BoxLayout):
         if self._recorded_steps:
             preset_db.save_schema(self.script_name, self._recorded_steps)
         self._set_status("Stop signal sent.", "warn")
+        self._maybe_prompt_preset_save()
 
     def run_script(self):
         if not self.script_path:
@@ -1239,6 +1302,7 @@ class RootWidget(BoxLayout):
                 # half-parsed argument list rather than guess at what the
                 # user meant.
                 self._show_message(f"Could not parse CLI Args: {exc}")
+                self._preset_build_mode = False
                 return
             self._append_output(
                 f"[run] Passing CLI arguments to sys.argv: {extra_args!r} -- the "
@@ -1657,6 +1721,7 @@ class RootWidget(BoxLayout):
             if self._collected_answers else ""
         )
         self._append_output(f"[run] Script process has exited.{note}\n")
+        self._maybe_prompt_preset_save()
 
     def _classify_output(self, content):
         """Cheap heuristic to turn raw tee'd output into a short status
