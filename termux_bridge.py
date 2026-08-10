@@ -234,16 +234,29 @@ def _read_answer_line():
         return line.rstrip("\n")
 
 
-def _bridged_input(prompt=""):
-    if prompt:
-        sys.__stdout__.write(str(prompt))
-        sys.__stdout__.flush()
+def _notify_prompt(prompt=""):
+    """Tell main.py a blocking read has actually started -- this is what
+    makes _on_socket_prompt fire the step UI immediately instead of
+    waiting out the quiet-tick timer. Shared by _bridged_input AND
+    _BridgedStdin below: a script that reads sys.stdin directly instead
+    of calling input() still needs this exact same live signal, or the
+    app would have no way to know it's time to show buttons at all --
+    blocking forever on a real answer is pointless if the UI never
+    appears to let a human provide one.
+    """
     if _channel[0] == "socket":
         try:
             _channel[1].write("PROMPT:" + str(prompt).replace("\n", " ") + "\n")
             _channel[1].flush()
         except OSError:
             pass
+
+
+def _bridged_input(prompt=""):
+    if prompt:
+        sys.__stdout__.write(str(prompt))
+        sys.__stdout__.flush()
+    _notify_prompt(prompt)
     return _read_answer_line()
 
 
@@ -270,7 +283,54 @@ class _BridgedStdout:
         return False
 
 
+class _BridgedStdin:
+    """Overriding builtins.input alone is NOT enough: a script that reads
+    the domain/count/whatever straight off sys.stdin (sys.stdin.readline(),
+    sys.stdin.read(), or a bare `for line in sys.stdin:`) instead of
+    calling input() bypasses that patch completely and hits Termux's real
+    stdin fd -- which RUN_COMMAND does not connect to a live terminal, so
+    it behaves like /dev/null: any read on it returns "" (EOF) instantly.
+    That is indistinguishable, from the target script's own point of view,
+    from a human submitting a blank answer -- exactly the "Invalid Domain
+    Selected!"-before-any-button-exists failure this class exists to rule
+    out. Routing every stdin read through the SAME _read_answer_line()
+    blocking shield as _bridged_input means it no longer matters which of
+    the two ways a script chooses to ask -- both are guaranteed to block
+    for a genuine answer instead of ever seeing a blank/EOF read.
+    """
+
+    def readline(self, *_a, **_k):
+        _notify_prompt()
+        return _read_answer_line() + "\n"
+
+    def read(self, size=-1):
+        _notify_prompt()
+        line = _read_answer_line() + "\n"
+        if size is not None and size >= 0:
+            return line[:size]
+        return line
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.readline()
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        try:
+            return sys.__stdin__.fileno()
+        except (AttributeError, OSError, ValueError):
+            return -1
+
+    def flush(self):
+        pass
+
+
 sys.stdout = _BridgedStdout(sys.stdout)
+sys.stdin = _BridgedStdin()
 
 
 def _report_fatal_error(exc):
